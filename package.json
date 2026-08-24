@@ -1,6 +1,6 @@
 {
   "name": "dsh-simplify",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek Harness 插件：评审最近改动的代码，提升清晰度、一致性与可维护性（由 pi-simplify 迁移）。",
   "license": "MIT",
   "type": "module",

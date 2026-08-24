@@ -32,15 +32,16 @@ dsh plugin --profile web add dsh-simplify
 执行后，插件把「变更文件 + 变更行范围 + 四条简化原则」作为用户消息注入
 当前 agent 会话（`next-turn`），模型随即按约束在变更行范围内完成简化并跑测试。
 
-## 功能清单（迁移自 pi-simplify）
+## 功能清单
 
-- git diff 变更检测：`--name-status` 解析（M/A/R/C），重命名/复制取新路径；
-- 变更行号提取：`--unified=0` 解析，相邻区间合并，count=0 跳过，纯删除文件降级提示；
-- 指定文件模式：显式文件列表按 `--ref`/`--staged` 取行号；
-- 回退逻辑：`HEAD` 无结果时回退 `HEAD~1`；
-- 提示词：Preserve functionality / Apply project standards / Enhance clarity / Maintain balance
+- **git diff 变更检测**：`--name-status` 解析（M/A/R/C），重命名/复制取新路径；工作区模式自动识别未跟踪新增文件（untracked）；
+- **变更行号提取**：`--unified=0` 解析，相邻区间合并，count=0 跳过，纯删除文件降级提示；
+- **参数与路径解析**：支持单双引号包裹的带空格路径与参数（如 `--ref="feature branch"`、`"dir with space/a.ts"`），自动规范化 Windows 路径；
+- **指定文件模式**：显式文件列表按 `--ref`/`--staged` 取行号；
+- **回退与透明提示**：`HEAD` 无结果时自动回退 `HEAD~1`，并在 UI 状态与提示词中显式标注回退来源；
+- **提示词**：Preserve functionality / Apply project standards / Enhance clarity / Maintain balance
   四条原则 + 变更行范围锁定 + 逐文件修改 + 跑测试 + 总结；
-- 无变更提示：不注入消息，直接返回 UI 提示文本。
+- **无变更提示**：不注入消息，直接返回 UI 提示文本。
 
 ## 开发
 

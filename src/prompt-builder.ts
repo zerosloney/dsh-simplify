@@ -20,10 +20,16 @@ function formatFile(file: ChangedFile): string {
   return `- ${file.path} (${file.status}; changed lines: ${ranges.join(", ")})`;
 }
 
-export function buildSimplifyPrompt(files: readonly ChangedFile[]): string {
+export function buildSimplifyPrompt(
+  files: readonly ChangedFile[],
+  refNote?: string,
+): string {
   const fileList = files.map(formatFile).join("\n");
+  const target = refNote
+    ? `the following files changed in ${refNote}`
+    : "the following recently changed files";
 
-  return `Review the following recently changed files and apply simplification improvements.
+  return `Review ${target} and apply simplification improvements.
 
 ## Principles
 

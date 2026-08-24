@@ -163,3 +163,11 @@ dsh web: http://127.0.0.1:3080   # 启动成功，无 dsh-simplify 相关错误
 - 打标签 `v0.1.0` 触发发布，**npm 已发布 `dsh-simplify@0.1.0`**（latest），
   发布物含 `lib/`（js+d.ts+map）、`cordis.patch.yml`、README、MIGRATION；
 - 安装方式从本地路径改为 npm 包：`dsh plugin --profile web add dsh-simplify`。
+
+### 9.3 鲁棒性增强与测试环境隔离改进（2026-08-25）
+
+- **参数引号与路径规范化**：`parseArgs` 支持单双引号包裹的带空格路径与参数（`tokenizeArgs`），并统一规范化 Windows 路径分隔符；
+- **工作区未跟踪文件检测**：工作区模式（无 `--staged` 且对比 `HEAD`）通过 `git ls-files --others --exclude-standard` 自动检测未暂存新增文件，归类为 `added`；
+- **回退透明度**：工作区无改动自动回退 `HEAD~1` 时，在 UI 提示与提示词中明确标注 `(fallback: comparing previous commit HEAD~1)`；
+- **测试环境隔离修复**：修复 `tests/simplify.test.mjs` 中 `process.cwd` 回落用例因受外部 git commit 历史干扰而偶发失败的问题，并新增引号解析、untracked 文件、回退标注等 5 项测试（共 22/22 全部通过）。
+

@@ -19,3 +19,9 @@ export interface SimplifyOptions {
   readonly ref: string;
   readonly staged: boolean;
 }
+
+export interface ChangedFilesResult {
+  readonly files: readonly ChangedFile[];
+  readonly fallbackRef?: string;
+}
+

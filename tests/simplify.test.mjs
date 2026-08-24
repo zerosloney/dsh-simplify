@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { parseArgs, handleSimplifyCommand } from "../lib/simplify-command.js";
+import { parseArgs, tokenizeArgs, handleSimplifyCommand } from "../lib/simplify-command.js";
 import { buildSimplifyPrompt } from "../lib/prompt-builder.js";
 import { parseDiffOutput, parseChangedLines, getChangedFiles } from "../lib/git-diff.js";
 
@@ -80,7 +80,7 @@ function fakeInvocation(overrides = {}) {
   return { invocation, appended };
 }
 
-// ---------- 1. 参数解析（与 pi-simplify parseArgs 行为一致） ----------
+// ---------- 1. 参数解析 ----------
 
 test("parseArgs: 默认值", () => {
   assert.deepEqual(parseArgs(""), { files: [], ref: "HEAD", staged: false });
@@ -103,7 +103,20 @@ test("parseArgs: 混合输入", () => {
   });
 });
 
-// ---------- 2. 提示词构建（逐字对照 pi-simplify buildSimplifyPrompt） ----------
+test("parseArgs: 引号包裹的带空格路径与 ref", () => {
+  assert.deepEqual(parseArgs(`"src/my file.ts" '--ref=feature/cool test' "lib/other dir/b.ts"`), {
+    files: ["src/my file.ts", "lib/other dir/b.ts"],
+    ref: "feature/cool test",
+    staged: false,
+  });
+  assert.deepEqual(parseArgs(`--ref="feature branch" src\\foo\\bar.ts`), {
+    files: ["src/foo/bar.ts"],
+    ref: "feature branch",
+    staged: false,
+  });
+});
+
+// ---------- 2. 提示词构建 ----------
 
 test("buildSimplifyPrompt: 变更行范围与原则", () => {
   const prompt = buildSimplifyPrompt([
@@ -126,6 +139,14 @@ test("buildSimplifyPrompt: 纯删除文件提示", () => {
     { path: "src/gone.ts", status: "modified", changedLines: [] },
   ]);
   assert.match(prompt, /src\/gone\.ts \(modified; deletions only — no current lines to simplify\)/);
+});
+
+test("buildSimplifyPrompt: 支持 refNote 标注文案", () => {
+  const prompt = buildSimplifyPrompt(
+    [{ path: "src/foo.ts", status: "modified", changedLines: [{ start: 1, end: 2 }] }],
+    "HEAD~1",
+  );
+  assert.match(prompt, /Review the following files changed in HEAD~1 and apply simplification improvements\./);
 });
 
 // ---------- 3. git diff 解析 ----------
@@ -165,14 +186,14 @@ test("getChangedFiles: 未提交改动（工作区）", async () => {
       Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join("\n") + "\n");
     git("add", "a.ts");
     git("commit", "-q", "-m", "init");
-    // 修改 a.ts（追加两行）并新增 b.ts（加入暂存区使其进入 diff 视野；
-    // 完全未跟踪的文件 git diff 不展示——与 pi-simplify 原版行为一致）
+    // 修改 a.ts（追加两行）并新增 b.ts（加入暂存区使其进入 diff 视野）
     writeFileSync(path.join(dir, "a.ts"),
       Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join("\n") + "\nline11\nline12\n");
     writeFileSync(path.join(dir, "b.ts"), "x\n");
     git("add", "b.ts");
 
-    const files = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
+    const { files, fallbackRef } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
+    assert.equal(fallbackRef, undefined);
     const a = files.find((f) => f.path === "a.ts");
     const b = files.find((f) => f.path === "b.ts");
     assert.ok(a, "a.ts 应出现在变更清单中");
@@ -186,7 +207,28 @@ test("getChangedFiles: 未提交改动（工作区）", async () => {
   }
 });
 
-test("getChangedFiles: --staged 只取暂存区", async () => {
+test("getChangedFiles: 检测未跟踪的新文件（untracked）", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "init.ts"), "initial\n");
+    git("add", "init.ts");
+    git("commit", "-q", "-m", "init");
+
+    // 新建文件但未 git add
+    writeFileSync(path.join(dir, "untracked.ts"), "console.log('untracked');\n");
+
+    const { files, fallbackRef } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
+    assert.equal(fallbackRef, undefined);
+    const untracked = files.find((f) => f.path === "untracked.ts");
+    assert.ok(untracked, "未跟踪的新文件应被识别为 added");
+    assert.equal(untracked.status, "added");
+    assert.equal(untracked.changedLines, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: --staged 只取暂存区（忽略 untracked）", async () => {
   const { dir, git } = makeRepo();
   try {
     writeFileSync(path.join(dir, "a.ts"), "v1\n");
@@ -196,7 +238,7 @@ test("getChangedFiles: --staged 只取暂存区", async () => {
     git("add", "a.ts");
     writeFileSync(path.join(dir, "b.ts"), "unstaged\n");
 
-    const files = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: true });
+    const { files } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: true });
     assert.deepEqual(files.map((f) => f.path).sort(), ["a.ts"]);
     assert.deepEqual(files.find((f) => f.path === "a.ts").changedLines, [{ start: 2, end: 2 }]);
   } finally {
@@ -213,7 +255,7 @@ test("getChangedFiles: 指定文件与回退分支", async () => {
     writeFileSync(path.join(dir, "a.ts"), "v1\nv2\n");
     writeFileSync(path.join(dir, "c.ts"), "c\n");
 
-    const files = await getChangedFiles(fakeCtx(), dir,
+    const { files } = await getChangedFiles(fakeCtx(), dir,
       { files: ["a.ts"], ref: "HEAD", staged: false });
     assert.deepEqual(files.map((f) => f.path), ["a.ts"]);
     assert.deepEqual(files[0].changedLines, [{ start: 2, end: 2 }]);
@@ -222,14 +264,36 @@ test("getChangedFiles: 指定文件与回退分支", async () => {
   }
 });
 
-test("getChangedFiles: 干净仓库返回空", async () => {
+test("getChangedFiles: 干净仓库无上一提交时返回空", async () => {
   const { dir, git } = makeRepo();
   try {
     writeFileSync(path.join(dir, "a.ts"), "v1\n");
     git("add", "a.ts");
     git("commit", "-q", "-m", "init");
-    const files = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
+    const { files, fallbackRef } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
     assert.deepEqual(files, []);
+    assert.equal(fallbackRef, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 干净工作区回退到上一条提交 HEAD~1", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), "v1\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+
+    writeFileSync(path.join(dir, "a.ts"), "v1\nv2\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "second commit");
+
+    const { files, fallbackRef } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
+    assert.equal(fallbackRef, "HEAD~1");
+    assert.equal(files.length, 1);
+    assert.equal(files[0].path, "a.ts");
+    assert.deepEqual(files[0].changedLines, [{ start: 2, end: 2 }]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -284,12 +348,43 @@ test("handleSimplifyCommand: 有变更时注入 next-turn 用户消息", async (
   }
 });
 
-test("handleSimplifyCommand: 会话无 cwd 时回落 process.cwd()", async () => {
-  // 无 header.cwd：getChangedFiles 在 process.cwd() 上跑，通常无未提交改动 →
-  // 返回"无变更"提示而非抛错。
-  const { invocation, appended } = fakeInvocation({ rawInput: "" });
-  const result = await handleSimplifyCommand(invocation, fakeCtx());
-  assert.equal(result.kind, "success");
-  assert.match(result.text, /No changed files found/);
-  assert.equal(appended.length, 0);
+test("handleSimplifyCommand: 回退 HEAD~1 时提示文本包含 fallback 说明", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), "v1\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+    writeFileSync(path.join(dir, "a.ts"), "v1\nv2\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "second");
+
+    const { invocation, appended } = fakeInvocation({
+      rawInput: "",
+      agent: { session: { header: { cwd: dir } }, inbox: { append: (target, message) => appended.push({ target, message }) } },
+    });
+    const result = await handleSimplifyCommand(invocation, fakeCtx());
+    assert.equal(result.kind, "success");
+    assert.match(result.text, /Simplify review queued for 1 changed file\(s\) \(fallback: comparing previous commit HEAD~1\)\./);
+    assert.equal(appended.length, 1);
+    assert.match(appended[0].message.content[0].text, /Review the following files changed in HEAD~1/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
+
+test("handleSimplifyCommand: 会话无 cwd 时回落 process.cwd()（环境隔离测试）", async () => {
+  const emptyDir = mkdtempSync(path.join(tmpdir(), "dsh-simplify-empty-"));
+  const prevCwd = process.cwd();
+  try {
+    process.chdir(emptyDir);
+    const { invocation, appended } = fakeInvocation({ rawInput: "" });
+    const result = await handleSimplifyCommand(invocation, fakeCtx());
+    assert.equal(result.kind, "success");
+    assert.match(result.text, /No changed files found/);
+    assert.equal(appended.length, 0);
+  } finally {
+    process.chdir(prevCwd);
+    rmSync(emptyDir, { recursive: true, force: true });
+  }
+});
+

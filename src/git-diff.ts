@@ -12,7 +12,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 // 引入 subprocess seam 的类型声明（含对 cordis Context 的模块增强：ctx.subprocess）。
 import type { SubprocessRuntime } from "@deepseek-ai/dsh-subprocess";
-import type { ChangedFile, LineRange, SimplifyOptions } from "./types.js";
+import type { ChangedFile, ChangedFilesResult, LineRange, SimplifyOptions } from "./types.js";
 
 const STATUS_MAP: Record<string, ChangedFile["status"]> = {
   M: "modified",
@@ -68,9 +68,9 @@ export function parseDiffOutput(stdout: string): ChangedFile[] {
     if (!status) continue;
 
     // Renamed (R100\told\tnew) and copied (C100\told\tnew) have two paths; use the new one.
-    const path = (status === "renamed" || status === "copied") ? parts[2] : parts[1];
-    if (path) {
-      files.push({ path, status });
+    const rawPath = (status === "renamed" || status === "copied") ? parts[2] : parts[1];
+    if (rawPath) {
+      files.push({ path: rawPath.replace(/\\/g, "/"), status });
     }
   }
 
@@ -111,7 +111,7 @@ function diffArgs(
   } else {
     args.push(ref);
   }
-  args.push("--", path);
+  args.push("--", path.replace(/\\/g, "/"));
   return args;
 }
 
@@ -138,10 +138,14 @@ export async function getChangedFiles(
   cwd: string,
   options: SimplifyOptions,
   signal?: AbortSignal,
-): Promise<ChangedFile[]> {
+): Promise<ChangedFilesResult> {
   if (options.files.length > 0) {
-    const files = options.files.map((path) => ({ path, status: "modified" as const }));
-    return addChangedLines(ctx, cwd, options, files, options.ref, signal);
+    const files = options.files.map((p) => ({
+      path: p.replace(/\\/g, "/"),
+      status: "modified" as const,
+    }));
+    const withLines = await addChangedLines(ctx, cwd, options, files, options.ref, signal);
+    return { files: withLines };
   }
 
   const args = ["diff", "--name-status"];
@@ -152,17 +156,43 @@ export async function getChangedFiles(
   }
 
   const result = await runGit(ctx, args, cwd, signal);
+  let files: ChangedFile[] = [];
   if (result.code === 0) {
-    const files = parseDiffOutput(result.stdout);
-    if (files.length > 0) return addChangedLines(ctx, cwd, options, files, options.ref, signal);
+    files = parseDiffOutput(result.stdout);
+  }
+
+  // 工作区模式（非 staged 且对比 HEAD 时）检测未跟踪的新文件
+  if (!options.staged && options.ref === "HEAD") {
+    const untracked = await runGit(ctx, ["ls-files", "--others", "--exclude-standard"], cwd, signal);
+    if (untracked.code === 0 && untracked.stdout.trim()) {
+      const existingPaths = new Set(files.map((f) => f.path));
+      for (const line of untracked.stdout.split("\n")) {
+        const p = line.trim().replace(/\\/g, "/");
+        if (p && !existingPaths.has(p)) {
+          files.push({ path: p, status: "added" });
+          existingPaths.add(p);
+        }
+      }
+    }
+  }
+
+  if (files.length > 0) {
+    const withLines = await addChangedLines(ctx, cwd, options, files, options.ref, signal);
+    return { files: withLines };
   }
 
   // Fallback: diff against previous commit
-  const fallback = await runGit(ctx, ["diff", "--name-status", "HEAD~1"], cwd, signal);
-  if (fallback.code === 0) {
-    const files = parseDiffOutput(fallback.stdout);
-    return addChangedLines(ctx, cwd, options, files, "HEAD~1", signal);
+  if (!options.staged && options.ref === "HEAD") {
+    const fallback = await runGit(ctx, ["diff", "--name-status", "HEAD~1"], cwd, signal);
+    if (fallback.code === 0) {
+      const fallbackFiles = parseDiffOutput(fallback.stdout);
+      if (fallbackFiles.length > 0) {
+        const withLines = await addChangedLines(ctx, cwd, options, fallbackFiles, "HEAD~1", signal);
+        return { files: withLines, fallbackRef: "HEAD~1" };
+      }
+    }
   }
 
-  return [];
+  return { files: [] };
 }
+
