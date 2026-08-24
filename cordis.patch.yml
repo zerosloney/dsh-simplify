@@ -1,0 +1,7 @@
+# dsh-simplify bundle patch：把 /simplify 命令插件插入任何将本包列入
+# `dsh.profile.bundles` 的 profile。插件需要 harness 核心服务
+# subprocess（跑 git）与 commands（注册斜杠命令）。
+- insert:
+    - id: simplify
+      name: 'dsh-simplify'
+      config: {}
