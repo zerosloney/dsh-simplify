@@ -6,9 +6,19 @@ DeepSeek Harness（dsh）插件：评审最近改动的代码，提升清晰度�
 ## 安装
 
 ```bash
-# 在目标 profile 中安装本插件（本地路径或 npm 包名均可）
-dsh plugin --profile web add E:\Demo\cli-tools\dsh-simplify
+# 在目标 profile 中安装本插件（npm 已发布，包名 dsh-simplify）
+dsh plugin --profile web add dsh-simplify
 ```
+
+> 本地开发版安装（源码路径，需先 `npm install && npm run build`）：
+> ```bash
+> dsh plugin --profile web add E:\Demo\cli-tools\dsh-simplify
+> ```
+
+> 版本要求：Node >= 22.19；宿主 dsh 0.1.1-rc.2 及以上（依赖 `dsh-llm ^0.1.1-rc.2`）。
+
+> 注意：`dsh plugin add` 只更新 profile 清单，**不会热加载到已运行的 dsh web 进程**，
+> 需重启 dsh web 后 `/simplify` 才会注册生效。
 
 ## 用法
 

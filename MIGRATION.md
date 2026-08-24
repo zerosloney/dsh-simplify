@@ -55,7 +55,9 @@ npm test          # node --test tests/（真实 git 临时仓库 + fake subproce
 ## 6. 集成与加载验证
 
 ```bash
-dsh plugin --profile web add <本插件路径>
+dsh plugin --profile web add dsh-simplify      # npm 已发布（0.1.0+）
+# 或本地路径（开发版，需先 npm install && npm run build）：
+# dsh plugin --profile web add <本插件路径>
 dsh --profile web --dump-config   # 确认 simplify 条目已插入组合树
 dsh web --no-open                 # 启动并检查日志无加载错误
 ```
@@ -151,3 +153,13 @@ dsh web: http://127.0.0.1:3080   # 启动成功，无 dsh-simplify 相关错误
 验证：`npm run typecheck` 与 `npm test`（17/17）通过。插件从 profile 以符号链接
 加载时，Node 沿真实路径解析到插件自身 node_modules，故对齐后与宿主版本一致，
 消除潜在双实例/类型漂移。
+
+### 9.2 GitHub 远端 + npm 发布（2026-08-24）
+
+- 初始化 git 仓库（分支 `main`），远端 `origin` → `https://github.com/zerosloney/dsh-simplify`（PUBLIC，与姊妹插件一致）；
+- 新增 `.github/workflows/ci.yml`（ubuntu/windows × node 22 测试矩阵）与
+  `.github/workflows/publish.yml`（`v*` 标签触发：install → test → publish，用仓库
+  `NPM_TOKEN` secret，账号 master0071）；
+- 打标签 `v0.1.0` 触发发布，**npm 已发布 `dsh-simplify@0.1.0`**（latest），
+  发布物含 `lib/`（js+d.ts+map）、`cordis.patch.yml`、README、MIGRATION；
+- 安装方式从本地路径改为 npm 包：`dsh plugin --profile web add dsh-simplify`。
