@@ -55,6 +55,28 @@ npm test           # 构建 + 功能等价测试（node --test，真实 git 仓�
 > 依赖版本与宿主闭包（dsh 0.1.1-rc.2）对齐：`@deepseek-ai/dsh-llm` 为运行时
 > 依赖（`createUserMessage`），其余 seam 包为构建期类型依赖（devDependencies）。
 
+## 发布（本机）
+
+GitHub Actions CI（`.github/workflows/ci.yml`，push/PR 自动跑 ubuntu/windows × node 22 测试）
+继续保留；仅移除发布 workflow（`publish.yml`），改为本机发布：
+
+```bash
+npm run publish:local            # patch（默认）
+npm run publish:local -- minor   # minor
+npm run publish:local -- major   # major
+```
+
+脚本（`scripts/publish.mjs`）流程：
+
+1. 校验 git 工作区干净（`npm version` 会创建 commit + tag，要求干净）；
+2. `npm version <bump>` —— 自动触发 `version` 钩子跑 `npm test`，
+   测试通过后才提交并打 `v*` 标签；
+3. `npm publish` 发布到 npm（`prepublishOnly` 钩子保证 `lib/` 为最新构建）；
+4. 提示手动推送：`git push && git push --tags`（本机发布不代替推送）。
+
+> 前置：本机已登录 npm（`npm whoami` 可验证）；账号开启 2FA 时按提示输入 OTP。
+> 如果 git 工作区有未提交改动，脚本会中止并列出待处理文件。
+
 ## 迁移说明
 
 变更点、API 映射与验证记录见 [MIGRATION.md](./MIGRATION.md)。

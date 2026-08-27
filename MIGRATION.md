@@ -171,3 +171,13 @@ dsh web: http://127.0.0.1:3080   # 启动成功，无 dsh-simplify 相关错误
 - **回退透明度**：工作区无改动自动回退 `HEAD~1` 时，在 UI 提示与提示词中明确标注 `(fallback: comparing previous commit HEAD~1)`；
 - **测试环境隔离修复**：修复 `tests/simplify.test.mjs` 中 `process.cwd` 回落用例因受外部 git commit 历史干扰而偶发失败的问题，并新增引号解析、untracked 文件、回退标注等 5 项测试（共 22/22 全部通过）。
 
+### 9.4 移除 GitHub Actions，改为本机发布（2026-08-25）
+
+- 删除 `.github/workflows/publish.yml`（`v*` 标签触发发布），发布不再依赖远端 CI / `NPM_TOKEN` secret；
+- **保留 `.github/workflows/ci.yml`**（push/PR 触发 ubuntu/windows × node 22 测试矩阵），远端 CI 能力不变；
+- 新增 `scripts/publish.mjs` 本机发布脚本，`npm run publish:local [patch|minor|major]`：
+  校验 git 工作区干净 → `npm version` 升版本并打 `v*` 标签（`version` 钩子自动跑 `npm test`，
+  测试失败则不提交）→ `npm publish`（`prepublishOnly` 钩子保证 `lib/` 为最新构建）；
+- package.json 新增 `version` / `prepublishOnly` / `publish:local` 三个脚本；
+- 本机发布不代替推送：发布成功后手动 `git push && git push --tags` 同步远端。
+
