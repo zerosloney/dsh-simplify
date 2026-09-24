@@ -181,3 +181,12 @@ dsh web: http://127.0.0.1:3080   # 启动成功，无 dsh-simplify 相关错误
 - package.json 新增 `version` / `prepublishOnly` / `publish:local` 三个脚本；
 - 本机发布不代替推送：发布成功后手动 `git push && git push --tags` 同步远端。
 
+### 9.5 恢复 GitHub Actions publish workflow（2026-09-25）
+
+- 从旧历史（远端 `v0.1.0` 标签指向的提交 `6b7ec61`）**原样恢复**
+  `.github/workflows/publish.yml`（`v*` 标签触发：install → test → publish，
+  使用仓库 `NPM_TOKEN` secret）；
+- `scripts/publish.mjs` 本机发布脚本保留不动，两种发布方式并存：打标签推送后
+  Actions 自动发布，本机 `npm run publish:local` 亦可（注意避免同一版本双发）；
+- 前置不变：仓库 Settings → Secrets and variables → Actions 中 `NPM_TOKEN` 需有效。
+
