@@ -92,7 +92,11 @@ export async function handleSimplifyCommand(
 ): Promise<CommandResult> {
   const options = parseArgs(invocation.rawInput);
   const cwd = sessionCwd(invocation);
-  const { files, fallbackRef } = await getChangedFiles(ctx, cwd, options, invocation.signal);
+  const { files, fallbackRef, error } = await getChangedFiles(ctx, cwd, options, invocation.signal);
+
+  if (error) {
+    return { kind: "error", text: `Failed to collect changed files: ${error}` };
+  }
 
   if (files.length === 0) {
     return {

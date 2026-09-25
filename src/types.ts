@@ -23,5 +23,7 @@ export interface SimplifyOptions {
 export interface ChangedFilesResult {
   readonly files: readonly ChangedFile[];
   readonly fallbackRef?: string;
+  /** git 失败时的单行用户可读错误（含 stderr 首行）；非空时 files 恒为空。 */
+  readonly error?: string;
 }
 

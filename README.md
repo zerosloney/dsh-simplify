@@ -34,11 +34,12 @@ dsh plugin --profile web add dsh-simplify
 
 ## 功能清单
 
-- **git diff 变更检测**：`--name-status` 解析（M/A/R/C），重命名/复制取新路径；工作区模式自动识别未跟踪新增文件（untracked）；
+- **git diff 变更检测**：`--name-status` 解析（M/A/R/C），重命名/复制取新路径；工作区模式自动识别未跟踪新增文件（untracked）；显式指定的未跟踪文件同样识别为整文件在范围内；
 - **变更行号提取**：`--unified=0` 解析，相邻区间合并，count=0 跳过，纯删除文件降级提示；
-- **参数与路径解析**：支持单双引号包裹的带空格路径与参数（如 `--ref="feature branch"`、`"dir with space/a.ts"`），自动规范化 Windows 路径；
+- **参数与路径解析**：支持单双引号包裹的带空格路径与参数（如 `--ref="feature branch"`、`"dir with space/a.ts"`），自动规范化 Windows 路径；非 ASCII 文件名（中文等）原样支持（`core.quotepath=off`）；
 - **指定文件模式**：显式文件列表按 `--ref`/`--staged` 取行号；
 - **回退与透明提示**：`HEAD` 无结果时自动回退 `HEAD~1`，并在 UI 状态与提示词中显式标注回退来源；
+- **错误透传**：未知 `--ref`、非 git 仓库等 git 失败直接以错误提示呈现（含 git 的 fatal 信息），不与「无变更」混淆；
 - **提示词**：Preserve functionality / Apply project standards / Enhance clarity / Maintain balance
   四条原则 + 变更行范围锁定 + 逐文件修改 + 跑测试 + 总结；
 - **无变更提示**：不注入消息，直接返回 UI 提示文本。

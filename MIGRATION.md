@@ -190,3 +190,31 @@ dsh web: http://127.0.0.1:3080   # 启动成功，无 dsh-simplify 相关错误
   Actions 自动发布，本机 `npm run publish:local` 亦可（注意避免同一版本双发）；
 - 前置不变：仓库 Settings → Secrets and variables → Actions 中 `NPM_TOKEN` 需有效。
 
+### 9.6 行为缺陷修复（2026-09-25）
+
+代码审查发现四个行为缺陷（两 P1 两 P2），修复如下：
+
+- **`--staged --ref=<branch>` 静默丢弃 ref（P1）**：旧实现 staged 时只传 `--cached`
+  （恒为暂存区 vs HEAD），`--ref` 被忽略；现改为 `git diff --cached <ref>`
+  （`--ref=HEAD` 默认时仍省略 ref——裸 `--cached` 与 `--cached HEAD` 等价，且在
+  无首提交的仓库里依然可用）。清单与行号提取同步修改，并删除只对回退路径有意义
+  的 `ref !== "HEAD~1"` 特判；
+- **git 失败被吞成「无变更」（P1）**：`runGit` 现在收集 stderr，`getChangedFiles`
+  返回值增加 `error` 字段，`handleSimplifyCommand` 将其映射为
+  `{ kind: "error" }`。未知 `--ref`、非 git 仓库（含 `--staged`）等失败会显式报错，
+  不再伪装成 "No changed files found"。归因细节：仓库外 `git diff` 会切到
+  `--no-index` 模式，报错（如 unknown option `cached`）会掩盖真实原因，故失败时先以
+  `git rev-parse --git-dir` 探测仓库可用性，不可用则报告其根因；无首提交仓库的
+  `git diff HEAD` 失败仍按预期回退 untracked/`HEAD~1`，行为不变；
+- **非 ASCII 路径被八进制转义（P2）**：git 调用统一加 `-c core.quotepath=off`，
+  中文等非 ASCII 文件名在 `--name-status` 清单、`ls-files --others` 与逐文件
+  行号 diff 全链路原样出现（继承自上游 pi-simplify 的问题）；
+- **显式传入的未跟踪文件被误标「纯删除」（P2）**：显式文件列表先经
+  `git ls-files --others --exclude-standard -- <paths>` 甄别，未跟踪新文件归类为
+  `added`（提示词为「整文件在范围内」），不再因 diff 为空被降级成
+  "deletions only" 而被模型跳过；
+- 测试 22 → 29：新增 `--staged+ref` 基准、无首提交 `--staged`、未知 ref 错误、
+  非 git 仓库错误、中文路径全链路、显式 untracked、handler 错误透传七组回归；
+  原「cwd 回落」用例从裸临时目录改为真实 git 仓库（非 git 目录现在会正确报错）。
+  29/29 通过。
+

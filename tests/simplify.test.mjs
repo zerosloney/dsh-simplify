@@ -373,18 +373,166 @@ test("handleSimplifyCommand: 回退 HEAD~1 时提示文本包含 fallback 说明
 });
 
 test("handleSimplifyCommand: 会话无 cwd 时回落 process.cwd()（环境隔离测试）", async () => {
-  const emptyDir = mkdtempSync(path.join(tmpdir(), "dsh-simplify-empty-"));
-  const prevCwd = process.cwd();
+  // 需要一个干净的 git 仓库：非 git 目录现在会返回 kind=error（见错误透传用例）
+  const { dir, git } = makeRepo();
   try {
-    process.chdir(emptyDir);
-    const { invocation, appended } = fakeInvocation({ rawInput: "" });
+    writeFileSync(path.join(dir, "a.ts"), "v1\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(dir);
+      const { invocation, appended } = fakeInvocation({ rawInput: "" });
+      const result = await handleSimplifyCommand(invocation, fakeCtx());
+      assert.equal(result.kind, "success");
+      assert.match(result.text, /No changed files found/);
+      assert.equal(appended.length, 0);
+    } finally {
+      process.chdir(prevCwd);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- 6. 行为缺陷修复回归（2026-09-25，详见 MIGRATION.md §9.6） ----------
+
+test("getChangedFiles: --staged --ref=<branch> 以该分支为基准（不再静默忽略 ref）", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), "v1\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+    const base = git("rev-parse", "--abbrev-ref", "HEAD").toString().trim();
+    git("checkout", "-q", "-b", "feature");
+    // feature 上已经有 x
+    writeFileSync(path.join(dir, "a.ts"), "v1\nx\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "feature adds x");
+    git("checkout", "-q", base);
+    // 暂存区 = "v1\nx\ny\n"
+    writeFileSync(path.join(dir, "a.ts"), "v1\nx\ny\n");
+    git("add", "a.ts");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir,
+      { files: [], ref: "feature", staged: true });
+    assert.deepEqual(files.map((f) => f.path), ["a.ts"]);
+    // vs feature 只有 y 是新的 → {3,3}；旧实现（裸 --cached，对比 HEAD="v1"）
+    // 会把 x、y 都算进来 → [{2,3}]
+    assert.deepEqual(files[0].changedLines, [{ start: 3, end: 3 }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 无首提交的仓库 --staged 仍可列出暂存新文件", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "fresh.ts"), "new\n");
+    git("add", "fresh.ts");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: true });
+    assert.deepEqual(files.map((f) => f.path), ["fresh.ts"]);
+    assert.equal(files[0].status, "added");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 未知的 --ref 返回错误而不是「无变更」", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), "v1\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+
+    const { files, error } = await getChangedFiles(fakeCtx(), dir,
+      { files: [], ref: "no-such-ref", staged: false });
+    assert.deepEqual(files, []);
+    assert.match(error ?? "", /no-such-ref/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 非 git 仓库返回错误（默认与 --staged 模式）", async () => {
+  const plain = mkdtempSync(path.join(tmpdir(), "dsh-simplify-norepo-"));
+  try {
+    const notARepo = /not a git repository/;
+    const workspace = await getChangedFiles(fakeCtx(), plain,
+      { files: [], ref: "HEAD", staged: false });
+    assert.match(workspace.error ?? "", notARepo);
+    assert.deepEqual(workspace.files, []);
+
+    const staged = await getChangedFiles(fakeCtx(), plain,
+      { files: [], ref: "HEAD", staged: true });
+    assert.match(staged.error ?? "", notARepo);
+  } finally {
+    rmSync(plain, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 中文文件名不被八进制转义（清单/行号/ls-files 全链路）", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "中文文件.ts"), "line1\n");
+    git("add", "中文文件.ts");
+    git("commit", "-q", "-m", "init");
+    writeFileSync(path.join(dir, "中文文件.ts"), "line1\nline2\n");
+    writeFileSync(path.join(dir, "新文件.ts"), "x\n");
+    git("add", "新文件.ts");
+    writeFileSync(path.join(dir, "未跟踪.ts"), "y\n");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir,
+      { files: [], ref: "HEAD", staged: false });
+    const modified = files.find((f) => f.path === "中文文件.ts");
+    assert.ok(modified, "diff 清单中的中文路径应原样出现");
+    assert.equal(modified.status, "modified");
+    // HEAD 只有 line1，工作区追加 line2 → hunk @@ -1,0 +2 @@ → {2,2}
+    assert.deepEqual(modified.changedLines, [{ start: 2, end: 2 }]);
+    const stagedFile = files.find((f) => f.path === "新文件.ts");
+    assert.ok(stagedFile, "暂存的中文新文件应原样出现");
+    assert.equal(stagedFile.status, "added");
+    const untrackedFile = files.find((f) => f.path === "未跟踪.ts");
+    assert.ok(untrackedFile, "ls-files 检出的中文未跟踪文件应原样出现");
+    assert.equal(untrackedFile.status, "added");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 显式指定的未跟踪文件归类为 added（整文件在范围内）", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), "v1\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+    writeFileSync(path.join(dir, "a.ts"), "v1\nv2\n");
+    writeFileSync(path.join(dir, "new.ts"), "brand new\n");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir,
+      { files: ["a.ts", "new.ts"], ref: "HEAD", staged: false });
+    assert.deepEqual(files.map((f) => f.status), ["modified", "added"]);
+    assert.deepEqual(files[0].changedLines, [{ start: 2, end: 2 }]);
+    assert.equal(files[1].changedLines, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("handleSimplifyCommand: git 失败时返回 kind=error（不再伪装成无变更）", async () => {
+  const plain = mkdtempSync(path.join(tmpdir(), "dsh-simplify-norepo-"));
+  try {
+    const { invocation, appended } = fakeInvocation({
+      rawInput: "",
+      agent: { session: { header: { cwd: plain } }, inbox: { append: (t, m) => appended.push({ target: t, message: m }) } },
+    });
     const result = await handleSimplifyCommand(invocation, fakeCtx());
-    assert.equal(result.kind, "success");
-    assert.match(result.text, /No changed files found/);
+    assert.equal(result.kind, "error");
+    assert.match(result.text, /not a git repository/);
     assert.equal(appended.length, 0);
   } finally {
-    process.chdir(prevCwd);
-    rmSync(emptyDir, { recursive: true, force: true });
+    rmSync(plain, { recursive: true, force: true });
   }
 });
 
