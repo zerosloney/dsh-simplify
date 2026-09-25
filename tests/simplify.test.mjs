@@ -11,7 +11,13 @@ import path from "node:path";
 
 import { parseArgs, tokenizeArgs, handleSimplifyCommand } from "../lib/simplify-command.js";
 import { buildSimplifyPrompt } from "../lib/prompt-builder.js";
-import { parseDiffOutput, parseChangedLines, getChangedFiles } from "../lib/git-diff.js";
+import {
+  parseDiffOutput,
+  parseChangedLines,
+  parseChangedLinesPerFile,
+  unquoteGitPath,
+  getChangedFiles,
+} from "../lib/git-diff.js";
 
 // ---------- 测试替身 ----------
 
@@ -50,6 +56,17 @@ function fakeSubprocess() {
 /** 最小 cordis 风格 ctx：只有插件用到的 subprocess seam。 */
 function fakeCtx() {
   return { subprocess: fakeSubprocess() };
+}
+
+/** 预置输出的 subprocess handle（用于 lossy / 错误注入，不真正起进程）。 */
+function fakeHandle({ stdout = "", stderr = "", code = 0, lossy = false }) {
+  return {
+    done: Promise.resolve({ exitCode: code }),
+    collected: {
+      stdout: { readFrom: () => ({ text: stdout, nextOffset: stdout.length, lossy }) },
+      stderr: { readFrom: () => ({ text: stderr, nextOffset: stderr.length, lossy: false }) },
+    },
+  };
 }
 
 /** 建一个真实 git 临时仓库。 */
@@ -534,5 +551,156 @@ test("handleSimplifyCommand: git 失败时返回 kind=error（不再伪装成无
   } finally {
     rmSync(plain, { recursive: true, force: true });
   }
+});
+
+// ---------- 7. 第二批修复回归（2026-09-25，详见 MIGRATION.md §9.7） ----------
+
+test("tokenizeArgs: 引号未闭合抛错（不再静默吞掉剩余输入）", () => {
+  assert.throws(() => parseArgs(`--ref="unclosed`), /Unclosed quote/);
+  assert.throws(() => tokenizeArgs(`"src/a.ts" 'single`), /Unclosed quote/);
+  // 正常配对不受影响
+  assert.deepEqual(parseArgs(`--ref="closed" a.ts`), { files: ["a.ts"], ref: "closed", staged: false });
+});
+
+test("unquoteGitPath: 引号路径反解码，普通路径原样返回", () => {
+  assert.equal(unquoteGitPath("src/foo.ts"), "src/foo.ts");
+  // quotepath 开启时代的中文路径（\344\270\255\346\226\207 = 中文 的 UTF-8 字节）
+  assert.equal(unquoteGitPath(`"\\344\\270\\255\\346\\226\\207.ts"`), "中文.ts");
+  // 控制字符与引号的 C 转义
+  assert.equal(unquoteGitPath(`"tab\\there.ts"`), "tab\there.ts");
+  assert.equal(unquoteGitPath(`"quote\\"d.ts"`), `quote"d.ts`);
+});
+
+test("parseDiffOutput: C-quoted 路径反解码", () => {
+  const files = parseDiffOutput(`M\t"\\344\\270\\255\\346\\226\\207.ts"\nA\tplain.ts\n`);
+  assert.deepEqual(files, [
+    { path: "中文.ts", status: "modified" },
+    { path: "plain.ts", status: "added" },
+  ]);
+});
+
+test("parseChangedLinesPerFile: 按文件归组 hunk，整文件删除段跳过", () => {
+  const out = [
+    "diff --git a/a.ts b/a.ts",
+    "index 111..222 100644",
+    "--- a/a.ts",
+    "+++ b/a.ts",
+    "@@ -1 +1,2 @@",
+    "+x",
+    "diff --git a/b.ts b/b.ts",
+    "--- a/b.ts",
+    "+++ b/b.ts",
+    "@@ -5 +5 @@",
+    "diff --git a/gone.ts b/gone.ts",
+    "--- a/gone.ts",
+    "+++ /dev/null",
+    "@@ -1 +0,0 @@",
+    "-x",
+  ].join("\n") + "\n";
+  const map = parseChangedLinesPerFile(out);
+  assert.deepEqual(map.get("a.ts"), [{ start: 1, end: 2 }]);
+  assert.deepEqual(map.get("b.ts"), [{ start: 5, end: 5 }]);
+  assert.equal(map.has("gone.ts"), false);
+});
+
+test("parseChangedLinesPerFile: hunk 内新增的内容行 `+++ b/x` 不误判为新文件段", () => {
+  const out = [
+    "diff --git a/a.ts b/a.ts",
+    "--- a/a.ts",
+    "+++ b/a.ts",
+    "@@ -1 +1,2 @@",
+    "+++ b/evil.ts",
+  ].join("\n") + "\n";
+  const map = parseChangedLinesPerFile(out);
+  assert.deepEqual([...map.keys()], ["a.ts"]);
+});
+
+test("getChangedFiles: 无首提交的仓库（工作区模式）列出已暂存与未跟踪文件", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "staged.ts"), "s\n");
+    git("add", "staged.ts");
+    writeFileSync(path.join(dir, "untracked.ts"), "u\n");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir,
+      { files: [], ref: "HEAD", staged: false });
+    assert.deepEqual(files.map((f) => f.path).sort(), ["staged.ts", "untracked.ts"]);
+    assert.ok(files.every((f) => f.status === "added"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 行号 diff stdout 截断（lossy）时降级为行号不可用", async () => {
+  const scripted = {
+    subprocess: {
+      spawn(spec) {
+        if (spec.argv.includes("--unified=0")) {
+          // 有合法 hunk 但标记截断：结果不可信，必须降级
+          return fakeHandle({
+            stdout: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1,2 @@\n",
+            lossy: true,
+          });
+        }
+        if (spec.argv.includes("ls-files")) return fakeHandle({ stdout: "" });
+        return fakeHandle({ stdout: "M\ta.ts\n" });
+      },
+    },
+  };
+
+  const { files } = await getChangedFiles(scripted, "unused",
+    { files: [], ref: "HEAD", staged: false });
+  assert.deepEqual(files.map((f) => f.path), ["a.ts"]);
+  assert.equal(files[0].changedLines, undefined);
+});
+
+test("getChangedFiles: 批量行号提取保持按文件归组", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), "a1\n");
+    writeFileSync(path.join(dir, "b.ts"), "b1\n");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+    writeFileSync(path.join(dir, "a.ts"), "a1\na2\n");
+    writeFileSync(path.join(dir, "b.ts"), "b1\nb2\n");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir,
+      { files: ["a.ts", "b.ts"], ref: "HEAD", staged: false });
+    assert.deepEqual(files.map((f) => f.changedLines), [
+      [{ start: 2, end: 2 }],
+      [{ start: 2, end: 2 }],
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("handleSimplifyCommand: spawn 级失败兜底为 kind=error", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), "v1\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+    const throwingCtx = { subprocess: { spawn() { throw new Error("git not found"); } } };
+    const { invocation, appended } = fakeInvocation({
+      rawInput: "",
+      agent: { session: { header: { cwd: dir } }, inbox: { append: (t, m) => appended.push({ target: t, message: m }) } },
+    });
+
+    const result = await handleSimplifyCommand(invocation, throwingCtx);
+    assert.equal(result.kind, "error");
+    assert.match(result.text, /git not found/);
+    assert.equal(appended.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("handleSimplifyCommand: 引号未闭合的输入返回 kind=error", async () => {
+  const { invocation, appended } = fakeInvocation({ rawInput: `--ref="unclosed` });
+  const result = await handleSimplifyCommand(invocation, fakeCtx());
+  assert.equal(result.kind, "error");
+  assert.match(result.text, /Unclosed quote/);
+  assert.equal(appended.length, 0);
 });
 

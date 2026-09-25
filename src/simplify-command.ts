@@ -23,6 +23,8 @@ export const COMMAND_NAME = "simplify";
 
 /**
  * 将命令行输入拆分为 token，支持双引号与单引号包裹的带空格参数。
+ * 有意不支持反斜杠转义：`\` 在 Windows 路径里是分隔符（parseArgs 随后统一
+ * 归一为 `/`）；引号未闭合直接抛错，避免静默吞掉剩余输入。
  */
 export function tokenizeArgs(input: string): string[] {
   const tokens: string[] = [];
@@ -47,6 +49,9 @@ export function tokenizeArgs(input: string): string[] {
     }
   }
 
+  if (inDouble || inSingle) {
+    throw new Error("Unclosed quote in command input");
+  }
   if (current.length > 0) {
     tokens.push(current);
   }
@@ -90,31 +95,37 @@ export async function handleSimplifyCommand(
   invocation: CommandInvocation,
   ctx: Context,
 ): Promise<CommandResult> {
-  const options = parseArgs(invocation.rawInput);
-  const cwd = sessionCwd(invocation);
-  const { files, fallbackRef, error } = await getChangedFiles(ctx, cwd, options, invocation.signal);
+  try {
+    const options = parseArgs(invocation.rawInput);
+    const cwd = sessionCwd(invocation);
+    const { files, fallbackRef, error } = await getChangedFiles(ctx, cwd, options, invocation.signal);
 
-  if (error) {
-    return { kind: "error", text: `Failed to collect changed files: ${error}` };
-  }
+    if (error) {
+      return { kind: "error", text: `Failed to collect changed files: ${error}` };
+    }
 
-  if (files.length === 0) {
+    if (files.length === 0) {
+      return {
+        kind: "success",
+        text: "No changed files found. Specify file paths or make some changes first.",
+      };
+    }
+
+    const prompt = buildSimplifyPrompt(files, fallbackRef);
+    invocation.agent.inbox.append("next-turn", createUserMessage({
+      content: [{ type: "text", text: prompt }],
+      source: { kind: "plugin", plugin: "dsh-simplify" },
+    }));
+
+    const fallbackNote = fallbackRef ? ` (fallback: comparing previous commit ${fallbackRef})` : "";
     return {
       kind: "success",
-      text: "No changed files found. Specify file paths or make some changes first.",
+      text: `Simplify review queued for ${files.length} changed file(s)${fallbackNote}.`,
     };
+  } catch (err) {
+    // spawn 级失败（git 不在 PATH 等）与参数解析抛错在此兜底为可读的命令错误
+    const message = err instanceof Error ? err.message : String(err);
+    return { kind: "error", text: `Failed to run simplify: ${message}` };
   }
-
-  const prompt = buildSimplifyPrompt(files, fallbackRef);
-  invocation.agent.inbox.append("next-turn", createUserMessage({
-    content: [{ type: "text", text: prompt }],
-    source: { kind: "plugin", plugin: "dsh-simplify" },
-  }));
-
-  const fallbackNote = fallbackRef ? ` (fallback: comparing previous commit ${fallbackRef})` : "";
-  return {
-    kind: "success",
-    text: `Simplify review queued for ${files.length} changed file(s)${fallbackNote}.`,
-  };
 }
 

@@ -218,3 +218,40 @@ dsh web: http://127.0.0.1:3080   # 启动成功，无 dsh-simplify 相关错误
   原「cwd 回落」用例从裸临时目录改为真实 git 仓库（非 git 目录现在会正确报错）。
   29/29 通过。
 
+### 9.7 第二批修复（2026-09-25）
+
+上一轮审查遗留的低优先级项全部处理：
+
+- **spawn 级异常兜底**：`handleSimplifyCommand` 整体 try/catch，git 不在 PATH 等
+  spawn 级失败返回 `{ kind: "error" }`，不再裸抛给命令派发层；
+- **无首提交仓库（工作区模式）补齐已暂存文件**：`git diff HEAD` 失败回退时，
+  原实现只靠 `ls-files --others`（不含 index 文件），`git add` 过但从未提交的
+  文件会被漏掉；现先用裸 `git diff --name-status --cached`（index vs 空树）
+  补充来源；
+- **stdout 截断检测**：`GitResult` 增加 `lossy`；行号 diff 超过 8MB 保留窗口的
+  块降级为「行号不可用」（`changedLines: undefined`，提示词侧有现成的
+  inspect-diff 兜底文案），不再用截断输出解析出行号范围；
+- **CI 卫生**：`ci.yml` / `publish.yml` 改 `npm ci`（lockfile 可复现安装）；
+  `ci.yml` 的 push 限定 `main` 分支，消除与 `pull_request` 的重复构建；
+- **行号 diff 批量化**：原逐文件 spawn（N+1，Windows 上每次约 50-100ms）改为
+  按路径分块（每块 ≤40 个路径，远低于 Windows 32k 命令行上限）一次取多个文件，
+  以 `+++ b/<path>` 段归组解析（`parseChangedLinesPerFile`）；`+++` 只在段首生效
+  一次，hunk 内新增的 `"+++ ..."` 内容行不会误判；失败的块整体降级，行为与
+  原逐文件失败一致；
+- **peer 依赖口径**：`@deepseek-ai/schemastery ^3.18.1` 加入 peerDependencies
+  （与 dsh-llm 同款「peer 声明 + dependencies 兜底」策略，修正 9.1 提交信息与
+  实际清单的偏差）；peer 范围的 prerelease 语义（第二段放行 0.1.1-rc.x）与
+  依赖策略在 README「开发」节写明；
+- **README**：移除安装示例中的个人绝对路径，改为通用占位；
+- **参数解析**：`tokenizeArgs` 引号未闭合直接抛错（经 handler 兜底呈现为
+  kind=error），不再静默吞掉剩余输入；有意不支持反斜杠转义（`\` 是 Windows
+  路径分隔符）；
+- **C-quoted 路径反解码**：`quotepath=off` 只放过非 ASCII，含 `"` / 控制字符的
+  路径仍被 git C-quote（`"..."` + `\NNN` 八进制）；新增 `unquoteGitPath` 在
+  `--name-status` 清单、`ls-files` 输出与批量 diff 的 `+++` 段三处统一还原
+  （未迁移 `-z`：patch 格式的路径渲染不受 `-z` 控制，且此类路径极罕见）；
+- 测试 29 → 39：新增引号未闭合（parseArgs / handler）、unquoteGitPath、
+  C-quoted 清单解析、按文件归组解析、`+++` 内容行不误判、unborn 仓库暂存+未跟踪、
+  lossy 降级（脚本化 subprocess 注入）、批量归组、spawn 抛错兜底十组回归。
+  39/39 通过。
+

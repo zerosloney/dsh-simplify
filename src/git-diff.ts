@@ -5,13 +5,15 @@
  *  - `pi.exec("git", args, { cwd })` → dsh `ctx.subprocess.spawn(...)`（树级终止、
  *    显式 stdio、graceMs、AbortSignal）；
  *  - `getChangedFiles` 签名增加 `signal` 参数；
- *  - 仅为了让测试可直接覆盖解析器，`parseDiffOutput` / `parseChangedLines`
- *    由私有改为导出（零行为改动）；
- *  - git 调用统一带 `-c core.quotepath=off`（非 ASCII 路径不被八进制转义）；
+ *  - 仅为了让测试可直接覆盖解析器，解析函数由私有改为导出（零行为改动）；
+ *  - git 调用统一带 `-c core.quotepath=off`（非 ASCII 路径不被八进制转义），
+ *    并对 C-quoted 路径反解码（含 `"` / 控制字符的文件名）；
  *  - 收集 stderr 并透传失败：未知 `--ref`、非 git 仓库等返回 `{ error }`，
  *    不再伪装成「无变更」（无首提交仓库的 `git diff HEAD` 失败仍按预期回退）；
- *  - `--staged --ref=<branch>` 以该分支为基准（`git diff --cached <ref>`），
- *    不再静默忽略 ref；显式传入的未跟踪文件归类为 added。
+ *  - `--staged --ref=<branch>` 以该分支为基准（`git diff --cached <ref>`）；
+ *  - 显式传入的未跟踪文件归类为 added；无首提交仓库用裸 `--cached` 补齐已暂存文件；
+ *  - 行号 diff 按路径分块批量化（一次 spawn 取多个文件）；stdout 截断（lossy）
+ *    的块降级为「行号不可用」。
  */
 
 import type { Context } from "@deepseek-ai/cordis";
@@ -31,6 +33,8 @@ export interface GitResult {
   readonly code: number | null;
   readonly stdout: string;
   readonly stderr: string;
+  /** stdout 超出保留窗口被截断（头部丢失）：此时解析结果不可信。 */
+  readonly lossy: boolean;
 }
 
 /**
@@ -58,9 +62,69 @@ export async function runGit(
     signal,
   });
   const outcome = await handle.done;
-  const stdout = handle.collected.stdout?.readFrom(0).text ?? "";
-  const stderr = handle.collected.stderr?.readFrom(0).text ?? "";
-  return { code: outcome.exitCode, stdout, stderr };
+  const stdoutRead = handle.collected.stdout?.readFrom(0);
+  const stderrRead = handle.collected.stderr?.readFrom(0);
+  return {
+    code: outcome.exitCode,
+    stdout: stdoutRead?.text ?? "",
+    stderr: stderrRead?.text ?? "",
+    lossy: stdoutRead?.lossy ?? false,
+  };
+}
+
+function pushUtf8(bytes: number[], ch: string): void {
+  const code = ch.charCodeAt(0);
+  if (code < 0x80) {
+    bytes.push(code);
+  } else {
+    bytes.push(...Buffer.from(ch, "utf8"));
+  }
+}
+
+/** git C 转义里「反斜杠 + 字母」对应的控制字符；`\"` 与 `\\` 取字面值。 */
+const C_ESCAPES: Record<string, number> = {
+  a: 0x07,
+  b: 0x08,
+  f: 0x0c,
+  n: 0x0a,
+  r: 0x0d,
+  t: 0x09,
+  v: 0x0b,
+  '"': 0x22,
+  "\\": 0x5c,
+};
+
+/**
+ * 反解码 git 的 C-quoted 路径。quotepath=off 只放过非 ASCII；含 `"` 或控制字符的
+ * 路径仍会输出成 `"..."` 包裹、`\NNN` 八进制 + C 转义的形式，这里还原为原始路径。
+ * 非引号包裹的输入原样返回。
+ */
+export function unquoteGitPath(p: string): string {
+  if (p.length < 2 || !p.startsWith('"') || !p.endsWith('"')) return p;
+
+  const end = p.length - 1;
+  const bytes: number[] = [];
+  for (let i = 1; i < end; i++) {
+    const ch = p[i]!;
+    if (ch !== "\\" || i + 1 >= end) {
+      pushUtf8(bytes, ch);
+      continue;
+    }
+    const octal = /^[0-7]{3}$/.exec(p.slice(i + 1, i + 4));
+    if (octal) {
+      bytes.push(parseInt(octal[0], 8));
+      i += 3;
+      continue;
+    }
+    const next = p[++i]!;
+    const escaped = C_ESCAPES[next];
+    if (escaped !== undefined) {
+      bytes.push(escaped);
+    } else {
+      pushUtf8(bytes, next);
+    }
+  }
+  return Buffer.from(bytes).toString("utf8");
 }
 
 /** 把一次 git 失败压缩成单行用户可读错误（取 stderr 首个非空行，通常是 fatal 行）。 */
@@ -87,6 +151,68 @@ async function repositoryError(
   return probe.code === 0 ? undefined : describeGitFailure("git rev-parse", probe);
 }
 
+const HUNK_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+
+/** 追加一个 hunk 头到区间列表：相邻合并、count=0（纯删除）跳过。 */
+function appendHunk(ranges: LineRange[], line: string): void {
+  const match = HUNK_RE.exec(line);
+  if (!match?.[1]) return;
+
+  const start = Number(match[1]);
+  const count = match[2] === undefined ? 1 : Number(match[2]);
+  if (count === 0) return;
+
+  const end = start + count - 1;
+  const previous = ranges.at(-1);
+  if (previous && start <= previous.end + 1) {
+    ranges[ranges.length - 1] = { start: previous.start, end: Math.max(previous.end, end) };
+  } else {
+    ranges.push({ start, end });
+  }
+}
+
+export function parseChangedLines(stdout: string): LineRange[] {
+  const ranges: LineRange[] = [];
+
+  for (const line of stdout.split("\n")) {
+    appendHunk(ranges, line);
+  }
+
+  return ranges;
+}
+
+/**
+ * 把一次多文件 diff（`git diff --unified=0 -- path1 path2 ...`）的输出按文件归组。
+ * 以 `+++ b/<path>` 行界定文件段（重命名/复制取新路径，`+++ /dev/null` 为整文件
+ * 删除，跳过）。`+++` 只在每段开头生效一次，hunk 内新增的 `"+++ ..."` 内容行
+ * 不会误判为新文件段。
+ */
+export function parseChangedLinesPerFile(stdout: string): Map<string, LineRange[]> {
+  const result = new Map<string, LineRange[]>();
+  let current: LineRange[] | undefined;
+  let sawTarget = false;
+
+  for (const line of stdout.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      current = undefined;
+      sawTarget = false;
+    } else if (!sawTarget && line.startsWith("+++ ")) {
+      sawTarget = true;
+      const target = unquoteGitPath(line.slice(4));
+      if (target.startsWith("b/") && target.length > 2) {
+        current = [];
+        result.set(target.slice(2), current);
+      } else {
+        current = undefined;
+      }
+    } else if (current) {
+      appendHunk(current, line);
+    }
+  }
+
+  return result;
+}
+
 export function parseDiffOutput(stdout: string): ChangedFile[] {
   const files: ChangedFile[] = [];
 
@@ -103,41 +229,32 @@ export function parseDiffOutput(stdout: string): ChangedFile[] {
     // Renamed (R100\told\tnew) and copied (C100\told\tnew) have two paths; use the new one.
     const rawPath = (status === "renamed" || status === "copied") ? parts[2] : parts[1];
     if (rawPath) {
-      files.push({ path: rawPath.replace(/\\/g, "/"), status });
+      files.push({ path: unquoteGitPath(rawPath).replace(/\\/g, "/"), status });
     }
   }
 
   return files;
 }
 
-export function parseChangedLines(stdout: string): LineRange[] {
-  const ranges: LineRange[] = [];
+/** 单次 spawn 最多携带的路径数：40 个长路径约 4k 参数，远低于 Windows 32k 命令行上限。 */
+const DIFF_CHUNK = 40;
 
-  for (const line of stdout.split("\n")) {
-    const match = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
-    if (!match?.[1]) continue;
-
-    const start = Number(match[1]);
-    const count = match[2] === undefined ? 1 : Number(match[2]);
-    if (count === 0) continue;
-
-    const end = start + count - 1;
-    const previous = ranges.at(-1);
-    if (previous && start <= previous.end + 1) {
-      ranges[ranges.length - 1] = { start: previous.start, end: Math.max(previous.end, end) };
-    } else {
-      ranges.push({ start, end });
-    }
-  }
-
-  return ranges;
-}
-
-function diffArgs(
+/**
+ * 批量取变更行区间：一次 `git diff --unified=0 [--cached] <ref> -- <paths...>`
+ * 携带多个路径，按 `+++` 段归组。失败或 stdout 截断（lossy）的块整体降级为
+ * 「行号不可用」（提示词侧有现成的 inspect-diff 兜底文案）。
+ */
+async function addChangedLines(
+  ctx: Context,
+  cwd: string,
   options: SimplifyOptions,
+  files: readonly ChangedFile[],
   ref: string,
-  path: string,
-): string[] {
+  signal?: AbortSignal,
+): Promise<ChangedFile[]> {
+  const targets = files.filter((f) => f.status !== "added");
+  if (targets.length === 0) return [...files];
+
   const args = ["diff", "--unified=0", "--no-ext-diff"];
   if (options.staged) {
     // `git diff --cached <ref>`：暂存区 vs 指定基准。默认基准省略 ref（等价
@@ -147,26 +264,23 @@ function diffArgs(
   } else {
     args.push(ref);
   }
-  args.push("--", path.replace(/\\/g, "/"));
-  return args;
-}
 
-async function addChangedLines(
-  ctx: Context,
-  cwd: string,
-  options: SimplifyOptions,
-  files: readonly ChangedFile[],
-  ref: string,
-  signal?: AbortSignal,
-): Promise<ChangedFile[]> {
-  return Promise.all(files.map(async (file) => {
-    if (file.status === "added") return file;
+  const changed = new Map<string, readonly LineRange[]>();
+  for (let i = 0; i < targets.length; i += DIFF_CHUNK) {
+    const chunk = targets.slice(i, i + DIFF_CHUNK);
+    const result = await runGit(ctx, [...args, "--", ...chunk.map((f) => f.path)], cwd, signal);
+    if (result.code !== 0 || result.lossy) continue;
+    const perFile = parseChangedLinesPerFile(result.stdout);
+    for (const file of chunk) {
+      // 无输出段（无改动）与纯删除文件一致：空区间
+      changed.set(file.path, perFile.get(file.path) ?? []);
+    }
+  }
 
-    const result = await runGit(ctx, diffArgs(options, ref, file.path), cwd, signal);
-    return result.code === 0
-      ? { ...file, changedLines: parseChangedLines(result.stdout) }
-      : file;
-  }));
+  return files.map((f) => {
+    const lines = changed.get(f.path);
+    return lines ? { ...f, changedLines: lines } : f;
+  });
 }
 
 export async function getChangedFiles(
@@ -187,7 +301,7 @@ export async function getChangedFiles(
       return { files: [], error: describeGitFailure("git ls-files", untracked) };
     }
     const untrackedPaths = new Set(
-      untracked.stdout.split("\n").map((line) => line.trim()).filter(Boolean),
+      untracked.stdout.split("\n").map((line) => unquoteGitPath(line.trim())).filter(Boolean),
     );
     const files = options.files.map((p) => ({
       path: p.replace(/\\/g, "/"),
@@ -211,7 +325,7 @@ export async function getChangedFiles(
   if (result.code === 0) {
     files = parseDiffOutput(result.stdout);
   } else if (!options.staged && options.ref === "HEAD") {
-    // 默认的 `git diff HEAD` 在无首提交的仓库会失败：属预期，交给 untracked/回退
+    // 默认的 `git diff HEAD` 在无首提交的仓库会失败：属预期，交给补充/回退路径
     headDiffFailed = true;
   } else {
     // 显式指定的 ref 失败（拼错分支等）或 --cached 失败：报错而不是伪装成「无变更」
@@ -221,11 +335,19 @@ export async function getChangedFiles(
 
   // 工作区模式（非 staged 且对比 HEAD 时）检测未跟踪的新文件
   if (!options.staged && options.ref === "HEAD") {
+    if (headDiffFailed) {
+      // 无首提交：`git diff HEAD` 不可用；用裸 --cached（index vs 空树）补齐已暂存文件，
+      // 否则 `git add` 过但从未提交的文件会被漏掉而误报「无变更」。
+      const stagedList = await runGit(ctx, ["diff", "--name-status", "--cached"], cwd, signal);
+      if (stagedList.code === 0) {
+        files = parseDiffOutput(stagedList.stdout);
+      }
+    }
     const untracked = await runGit(ctx, ["ls-files", "--others", "--exclude-standard"], cwd, signal);
     if (untracked.code === 0 && untracked.stdout.trim()) {
       const existingPaths = new Set(files.map((f) => f.path));
       for (const line of untracked.stdout.split("\n")) {
-        const p = line.trim().replace(/\\/g, "/");
+        const p = unquoteGitPath(line.trim()).replace(/\\/g, "/");
         if (p && !existingPaths.has(p)) {
           files.push({ path: p, status: "added" });
           existingPaths.add(p);
@@ -256,4 +378,3 @@ export async function getChangedFiles(
 
   return { files: [] };
 }
-
