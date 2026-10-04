@@ -34,12 +34,12 @@ dsh plugin --profile web add dsh-simplify
 
 ## 功能清单
 
-- **git diff 变更检测**：`--name-status` 解析（M/A/R/C），重命名/复制取新路径；工作区模式自动识别未跟踪新增文件（untracked）；新仓库（无首提交）也能列出暂存区与未跟踪的新文件；显式指定的未跟踪文件同样识别为整文件在范围内；
-- **变更行号提取**：`--unified=0` 解析，相邻区间合并，count=0 跳过，纯删除文件降级提示；按路径分块批量提取（一次 git 调用取多个文件）；输出超限截断时降级为「行号不可用」；
-- **参数与路径解析**：支持单双引号包裹的带空格路径与参数（如 `--ref="feature branch"`、`"dir with space/a.ts"`，引号未闭合直接报错），自动规范化 Windows 路径；非 ASCII 文件名（中文等）与含特殊字符的路径原样支持（`core.quotepath=off` + C-quote 反解码）；
+- **git diff 变更检测**：`--name-status` 解析（M/A/R/C），重命名/复制取新路径并保留来源路径；工作区模式自动识别未跟踪新增文件（untracked）；新仓库（无首提交）也能列出暂存区与未跟踪的新文件；显式指定的未跟踪文件同样识别为整文件在范围内；
+- **变更行号提取**：`--unified=0` 解析，相邻区间合并，count=0 跳过，纯删除文件降级提示；按路径分块批量提取（一次 git 调用取多个文件）；输出超限截断时降级为「行号不可用」；重命名/复制会把新旧路径成对交给 pathspec 并显式 `-M`，保证只报真实变更行而非整个文件；
+- **参数与路径解析**：支持单双引号包裹的带空格路径与参数（如 `--ref="feature branch"`、`"dir with space/a.ts"`，引号未闭合直接报错），自动规范化 Windows 路径；非 ASCII 文件名（中文、emoji、CJK 扩展 B 等）与含特殊字符的路径原样支持（`core.quotepath=off` + 按码点 C-quote 反解码）；
 - **指定文件模式**：显式文件列表按 `--ref`/`--staged` 取行号；
 - **回退与透明提示**：`HEAD` 无结果时自动回退 `HEAD~1`，并在 UI 状态与提示词中显式标注回退来源；
-- **错误透传**：未知 `--ref`、非 git 仓库、git 不在 PATH 等失败直接以错误提示呈现（含 git 的 fatal 信息），不与「无变更」混淆；
+- **错误透传**：未知 `--ref`、非 git 仓库、git 不在 PATH 等失败直接以错误提示呈现（含 git 的 fatal 信息），不与「无变更」混淆；终止原因区分「用户取消」「超时（30s）」「被信号杀死」「非 0 退出码」，不混为一谈；
 - **提示词**：Preserve functionality / Apply project standards / Enhance clarity / Maintain balance
   四条原则 + 变更行范围锁定 + 逐文件修改 + 跑测试 + 总结；
 - **无变更提示**：不注入消息，直接返回 UI 提示文本。

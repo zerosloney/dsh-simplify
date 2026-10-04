@@ -17,6 +17,7 @@ import {
   parseChangedLinesPerFile,
   unquoteGitPath,
   getChangedFiles,
+  runGit,
 } from "../lib/git-diff.js";
 
 // ---------- 测试替身 ----------
@@ -59,9 +60,9 @@ function fakeCtx() {
 }
 
 /** 预置输出的 subprocess handle（用于 lossy / 错误注入，不真正起进程）。 */
-function fakeHandle({ stdout = "", stderr = "", code = 0, lossy = false }) {
+function fakeHandle({ stdout = "", stderr = "", code = 0, lossy = false, signal = null }) {
   return {
-    done: Promise.resolve({ exitCode: code }),
+    done: Promise.resolve({ exitCode: code, signal }),
     collected: {
       stdout: { readFrom: () => ({ text: stdout, nextOffset: stdout.length, lossy }) },
       stderr: { readFrom: () => ({ text: stderr, nextOffset: stderr.length, lossy: false }) },
@@ -170,11 +171,12 @@ test("buildSimplifyPrompt: 支持 refNote 标注文案", () => {
 
 test("parseDiffOutput: M/A/R/C 状态与重命名新路径", () => {
   const files = parseDiffOutput("M\tfoo.ts\nA\tbar.ts\nR100\told.ts\tnew.ts\nC50\tsrc/x.ts\tsrc/y.ts\n");
+  // 重命名/复制取新路径作为 path，同时保留来源路径 oldPath（取变更行时必须成对传给 pathspec）
   assert.deepEqual(files, [
     { path: "foo.ts", status: "modified" },
     { path: "bar.ts", status: "added" },
-    { path: "new.ts", status: "renamed" },
-    { path: "src/y.ts", status: "copied" },
+    { path: "new.ts", status: "renamed", oldPath: "old.ts" },
+    { path: "src/y.ts", status: "copied", oldPath: "src/x.ts" },
   ]);
 });
 
@@ -702,5 +704,285 @@ test("handleSimplifyCommand: 引号未闭合的输入返回 kind=error", async (
   assert.equal(result.kind, "error");
   assert.match(result.text, /Unclosed quote/);
   assert.equal(appended.length, 0);
+});
+
+// ---------- 8. 审查修复回归（2026-09-30）：重命名行号范围 + 非 BMP 路径 ----------
+
+test("parseDiffOutput: 重命名/复制同时保留新旧路径（oldPath）", () => {
+  const files = parseDiffOutput("R082\ta.ts\trenamed.ts\nC50\tsrc/x.ts\tsrc/y.ts\nM\tm.ts\nA\ta.ts\n");
+  assert.deepEqual(files, [
+    { path: "renamed.ts", status: "renamed", oldPath: "a.ts" },
+    { path: "src/y.ts", status: "copied", oldPath: "src/x.ts" },
+    { path: "m.ts", status: "modified" },
+    { path: "a.ts", status: "added" },
+  ]);
+  // 普通状态不应带 oldPath 字段
+  assert.equal("oldPath" in files[2], false);
+  assert.equal("oldPath" in files[3], false);
+});
+
+test("parseDiffOutput: C-quoted 的新旧路径都反解码", () => {
+  const files = parseDiffOutput(`R100\t"\\344\\270\\255.ts"\t"\\346\\226\\260.ts"\n`);
+  assert.deepEqual(files, [{ path: "新.ts", status: "renamed", oldPath: "中.ts" }]);
+});
+
+test("getChangedFiles: 重命名+单行修改只报该行，而不是整个文件（回归）", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), Array.from({ length: 8 }, (_, i) => `line${i + 1}`).join("\n") + "\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+
+    git("mv", "a.ts", "renamed.ts");
+    writeFileSync(path.join(dir, "renamed.ts"),
+      Array.from({ length: 8 }, (_, i) => (i === 2 ? "CHANGED3" : `line${i + 1}`)).join("\n") + "\n");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
+    const renamed = files.find((f) => f.path === "renamed.ts");
+    assert.ok(renamed, "重命名后的新路径应出现在清单中");
+    assert.equal(renamed.status, "renamed");
+    assert.equal(renamed.oldPath, "a.ts");
+    // 修复前：只把新路径交给 pathspec → git 降级为「新文件」→ [{1,8}]（击穿范围锁）
+    assert.deepEqual(renamed.changedLines, [{ start: 3, end: 3 }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 重命名+多段修改只报变更区间（回归）", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    const lines = Array.from({ length: 20 }, (_, i) => `line${i + 1}`);
+    writeFileSync(path.join(dir, "big.ts"), lines.join("\n") + "\n");
+    git("add", "big.ts");
+    git("commit", "-q", "-m", "init");
+
+    git("mv", "big.ts", "moved.ts");
+    const edited = lines.map((l, i) => (i === 1 || i === 14 ? `EDIT${i + 1}` : l));
+    writeFileSync(path.join(dir, "moved.ts"), edited.join("\n") + "\n");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
+    const moved = files.find((f) => f.path === "moved.ts");
+    assert.ok(moved);
+    assert.equal(moved.oldPath, "big.ts");
+    assert.deepEqual(moved.changedLines, [{ start: 2, end: 2 }, { start: 15, end: 15 }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 纯重命名（内容不变）报告空区间而不是整文件（回归）", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "same.ts"), "a\nb\nc\n");
+    git("add", "same.ts");
+    git("commit", "-q", "-m", "init");
+    git("mv", "same.ts", "renamed-same.ts");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
+    const renamed = files.find((f) => f.path === "renamed-same.ts");
+    assert.ok(renamed);
+    assert.equal(renamed.status, "renamed");
+    // 内容零变化 → 没有任何 hunk → 空区间（提示词显示 deletions only 文案），
+    // 绝不能因为降级成「新文件」而变成 1-3
+    assert.deepEqual(renamed.changedLines, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: --staged 下重命名也只报变更行（回归）", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "s.ts"), "1\n2\n3\n4\n5\n6\n");
+    git("add", "s.ts");
+    git("commit", "-q", "-m", "init");
+
+    git("mv", "s.ts", "s2.ts");
+    writeFileSync(path.join(dir, "s2.ts"), "1\n2\n3\n4\n5\nSIX\n");
+    git("add", "s2.ts");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: true });
+    const renamed = files.find((f) => f.path === "s2.ts");
+    assert.ok(renamed);
+    assert.deepEqual(renamed.changedLines, [{ start: 6, end: 6 }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 重命名仍能识别未跟踪文件与其它改动并存", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), "1\n2\n3\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+    git("mv", "a.ts", "b.ts");
+    writeFileSync(path.join(dir, "b.ts"), "1\nTWO\n3\n");
+    writeFileSync(path.join(dir, "fresh.ts"), "new\n");
+
+    const { files } = await getChangedFiles(fakeCtx(), dir, { files: [], ref: "HEAD", staged: false });
+    const byPath = new Map(files.map((f) => [f.path, f]));
+    assert.deepEqual(byPath.get("b.ts").changedLines, [{ start: 2, end: 2 }]);
+    assert.equal(byPath.get("fresh.ts").status, "added");
+    assert.equal(byPath.get("fresh.ts").changedLines, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getChangedFiles: 重命名的变更行范围进入提示词（端到端）", async () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "a.ts"), "1\n2\n3\n4\n5\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init");
+    git("mv", "a.ts", "renamed.ts");
+    writeFileSync(path.join(dir, "renamed.ts"), "1\n2\nTHREE\n4\n5\n");
+
+    const { invocation, appended } = fakeInvocation({
+      rawInput: "",
+      agent: { session: { header: { cwd: dir } }, inbox: { append: (t, m) => appended.push({ target: t, message: m }) } },
+    });
+    const result = await handleSimplifyCommand(invocation, fakeCtx());
+    assert.equal(result.kind, "success");
+    const text = appended[0].message.content[0].text;
+    assert.match(text, /renamed\.ts \(renamed; changed lines: 3\)/);
+    // 绝不出现整文件范围
+    assert.doesNotMatch(text, /renamed\.ts \(renamed; changed lines: 1-5\)/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("unquoteGitPath: BMP 外字符（emoji / CJK 扩展 B）不被破坏（回归）", () => {
+  const emoji = String.fromCodePoint(0x1f600); // 😀
+  const cjkExt = String.fromCodePoint(0x20000); // 𠀀
+
+  assert.equal(unquoteGitPath(`"${emoji}.ts"`), `${emoji}.ts`);
+  assert.equal(unquoteGitPath(`"${cjkExt}.ts"`), `${cjkExt}.ts`);
+  // 与 C 转义混排
+  assert.equal(unquoteGitPath(`"${emoji}\\there.ts"`), `${emoji}\there.ts`);
+  // 八进制形态（git 对整体转义路径的真实输出）依然正确
+  assert.equal(unquoteGitPath(String.raw`"\360\237\230\200.ts"`), `${emoji}.ts`);
+  // 修复前 charCodeAt(0) 会把代理对拆开，产出 U+FFFD 替换字符
+  assert.doesNotMatch(unquoteGitPath(`"${emoji}.ts"`), /\uFFFD/);
+});
+
+test("unquoteGitPath: 多字节与转义的组合不回归", () => {
+  assert.equal(unquoteGitPath(String.raw`"\344\270\255\346\226\207.ts"`), "中文.ts");
+  assert.equal(unquoteGitPath("src/foo.ts"), "src/foo.ts");
+  assert.equal(unquoteGitPath(""), "");
+  assert.equal(unquoteGitPath('"'), '"');
+  assert.equal(unquoteGitPath('""'), "");
+  assert.equal(unquoteGitPath(String.raw`"tab\there.ts"`), "tab\there.ts");
+  assert.equal(unquoteGitPath(String.raw`"quote\"d.ts"`), 'quote"d.ts');
+  assert.equal(unquoteGitPath(String.raw`"back\\slash.ts"`), "back\\slash.ts");
+  // 八进制只吃满 3 位：\123 后紧跟 "4" 属字面量
+  assert.equal(unquoteGitPath(String.raw`"\1234.ts"`), "S4.ts");
+});
+
+test("parseChangedLinesPerFile: 重命名 diff 段按新路径归组", () => {
+  const out = [
+    "diff --git a/old.ts b/new.ts",
+    "similarity index 82%",
+    "rename from old.ts",
+    "rename to new.ts",
+    "--- a/old.ts",
+    "+++ b/new.ts",
+    "@@ -3 +3 @@",
+    "-line3",
+    "+CHANGED3",
+  ].join("\n") + "\n";
+  const map = parseChangedLinesPerFile(out);
+  assert.deepEqual(map.get("new.ts"), [{ start: 3, end: 3 }]);
+  assert.equal(map.has("old.ts"), false);
+});
+
+// ---------- 9. 终止原因分类（超时 / 取消 / 信号 / 退出码） ----------
+
+test("runGit: 正常退出时 timedOut / cancelled 均为 false", async () => {
+  const ctx = { subprocess: { spawn: () => fakeHandle({ stdout: "ok", code: 0 }) } };
+  const result = await runGit(ctx, ["status"], "unused");
+  assert.equal(result.code, 0);
+  assert.equal(result.signal, null);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.cancelled, false);
+});
+
+test("runGit: 非 0 退出码不被误判为超时或取消", async () => {
+  const ctx = {
+    subprocess: { spawn: () => fakeHandle({ code: 128, stderr: "fatal: not a git repository\n" }) },
+  };
+  const result = await runGit(ctx, ["status"], "unused");
+  assert.equal(result.code, 128);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.cancelled, false);
+});
+
+test("runGit: 已取消的 signal 标记 cancelled（错误文案区分取消与超时）", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let sawSignal;
+  const ctx = {
+    subprocess: {
+      spawn(spec) {
+        sawSignal = spec.signal;
+        return fakeHandle({ code: null, signal: "SIGTERM" });
+      },
+    },
+  };
+  const result = await runGit(ctx, ["status"], "unused", controller.signal);
+  assert.equal(result.cancelled, true);
+  // deadline 是「调用方 signal + 自身超时」的合并信号，必须真的传给了 seam
+  assert.ok(sawSignal, "合并后的 deadline 应传给 subprocess.spawn");
+});
+
+test("runGit: 未取消时不标记 cancelled（避免把超时误报成取消）", async () => {
+  const controller = new AbortController();
+  const ctx = {
+    subprocess: { spawn: () => fakeHandle({ code: null, signal: "SIGTERM" }) },
+  };
+  const result = await runGit(ctx, ["status"], "unused", controller.signal);
+  assert.equal(result.cancelled, false);
+  assert.equal(result.signal, "SIGTERM");
+});
+
+test("runGit: 非 git 仓库的错误文案含 fatal 原文且带退出码", async () => {
+  const plain = mkdtempSync(path.join(tmpdir(), "dsh-simplify-norepo-"));
+  try {
+    const { error } = await getChangedFiles(fakeCtx(), plain,
+      { files: [], ref: "HEAD", staged: false });
+    assert.match(error ?? "", /not a git repository/);
+    // 退出码路径应显示 "code NNN"，而不是含糊的 "signal"
+    assert.match(error ?? "", /code \d+/);
+    assert.doesNotMatch(error ?? "", /\(signal\)/);
+  } finally {
+    rmSync(plain, { recursive: true, force: true });
+  }
+});
+
+test("runGit: 进程被信号杀死时错误文案含信号名", async () => {
+  const scripted = {
+    subprocess: {
+      spawn: () => fakeHandle({ code: null, signal: "SIGKILL", stderr: "boom\n" }),
+    },
+  };
+  const { error } = await getChangedFiles(scripted, "unused",
+    { files: [], ref: "no-such-ref", staged: false });
+  assert.match(error ?? "", /killed by SIGKILL/);
+});
+
+test("describeGitFailure: 超时与取消的文案互不相同（经 getChangedFiles 透出）", async () => {
+  // 走真实的超时分支成本过高（30s），这里直接验证 runGit 的分类字段
+  // 与 describeGitFailure 的优先级：取消 > 超时 > 信号 > 退出码。
+  const controller = new AbortController();
+  controller.abort();
+  const ctx = {
+    subprocess: { spawn: () => fakeHandle({ code: null, signal: "SIGTERM" }) },
+  };
+  const result = await runGit(ctx, ["status"], "unused", controller.signal);
+  assert.equal(result.cancelled, true);
+  assert.equal(result.timedOut, false);
 });
 

@@ -32,9 +32,7 @@ export function tokenizeArgs(input: string): string[] {
   let inDouble = false;
   let inSingle = false;
 
-  for (let i = 0; i < input.length; i++) {
-    const char = input[i];
-
+  for (const char of input) {
     if (char === '"' && !inSingle) {
       inDouble = !inDouble;
     } else if (char === "'" && !inDouble) {

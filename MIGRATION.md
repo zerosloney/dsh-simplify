@@ -49,8 +49,13 @@ npm run build     # tsc → lib/
 npm test          # node --test tests/（真实 git 临时仓库 + fake subprocess seam）
 ```
 
-测试覆盖：参数解析 ×4、提示词构建 ×3、diff 解析 ×3、变更文件收集 ×4（真实 git）、
-命令处理 ×3（inbox 注入 / 无变更 / cwd 回落）。
+测试覆盖（共 50 项，按被测对象分组）：`getChangedFiles` ×21（真实 git 临时仓库）、
+`handleSimplifyCommand` ×7（inbox 注入 / 无变更 / cwd 回落 / 错误透传）、
+`parseArgs` ×5、`parseDiffOutput` ×5、`buildSimplifyPrompt` ×4、
+`parseChangedLinesPerFile` ×3、`unquoteGitPath` ×3、`parseChangedLines` ×1、
+`tokenizeArgs` ×1。
+
+> 分组数量会随回归用例增加而变化；以 `npm test` 实际输出为准，本节不追平每次增量。
 
 ## 6. 集成与加载验证
 
@@ -139,6 +144,10 @@ dsh web: http://127.0.0.1:3080   # 启动成功，无 dsh-simplify 相关错误
   非 `next-step`（当前轮立即续跑），与 pi 的 follow-up 语义一致。
 
 ## 9. 变更记录
+
+> 阅读约定：本节的测试计数（如「17/17」「22/22」「39/39」「50/50」）是**各条目
+> 撰写当日的验证快照**，用于记录该次改动交付时的状态，不随后续用例增加而回改。
+> 当前测试总数与分组以 §5 与 `npm test` 实际输出为准。
 
 ### 9.1 依赖对齐宿主版本（2026-08-24）
 
@@ -254,4 +263,112 @@ dsh web: http://127.0.0.1:3080   # 启动成功，无 dsh-simplify 相关错误
   C-quoted 清单解析、按文件归组解析、`+++` 内容行不误判、unborn 仓库暂存+未跟踪、
   lossy 降级（脚本化 subprocess 注入）、批量归组、spawn 抛错兜底十组回归。
   39/39 通过。
+
+## 9.8 代码审查修复（2026-09-30）：重命名行号范围 + 非 BMP 路径
+
+对照源码逐行审查（`npm test` 39/39、`npm run typecheck` 干净的状态下）发现两个
+提示词范围锁的缺陷，均已修复并补回归测试，测试 39 → 50。
+
+### 缺陷 1（功能性）：重命名文件被误报为「整个文件都在变更范围」
+
+`addChangedLines` 只把**新路径**交给 pathspec（`git diff --unified=0 HEAD -- renamed.ts`），
+git 的 rename 检测拿不到新旧路径配对，于是把重命名降级成「新文件」段，输出
+`--- /dev/null` + `+++ b/renamed.ts` + `@@ -0,0 +1,N @@`，整个文件被算作变更行。
+
+实测（8 行文件，`git mv` 后只改第 3 行）：
+
+- 修复前：`changedLines: [{start: 1, end: 8}]` —— 击穿提示词「只改变更行」的范围锁，
+  模型可合法重写整个文件；
+- 修复后：`changedLines: [{start: 3, end: 3}]`。
+
+`git diff --name-status` 本身正确识别为 `R082`，问题只出在取行号的二次 diff。
+
+修复：
+
+- `ChangedFile` 新增 `oldPath?`（[src/types.ts](src/types.ts)），`parseDiffOutput`
+  保留 `--name-status` 的第二个路径（此前被丢弃，只取 `parts[2]`）；
+- `addChangedLines` 把新旧路径**成对**加入 pathspec（`Set` 去重），并显式加 `-M`
+  开启重命名检测（`diff.<driver>` 等配置可能关掉默认值）；
+- 取行号时先按新路径查，退化段（未识别为 rename）回退按旧路径查；
+- 抽出 `normalizePath`（反解码 + 正斜杠归一），消除三处重复。
+
+### 缺陷 2（潜在）：`unquoteGitPath` 破坏 BMP 外字符
+
+旧实现按 UTF-16 **码元**索引（`p[i]` + `charCodeAt(0)`），把 emoji / CJK 扩展 B
+的代理对拆成两个孤立代理项，各自编码为 U+FFFD：`"😀.ts"` → `"��.ts"`。
+
+当前 Windows 环境**不可达**（`quotepath=off` 下 git 对非 BMP 路径原样裸输出，
+不进入 C-quote 分支；唯一会「加引号 + 内含裸非 BMP」的文件名组合需要 `"`，
+而 Windows 文件名不允许），但解析器契约内确属错误，Linux/macOS 上可触发。
+
+修复：改为按**码点**切分（`[...p.slice(1, -1)]`），非 ASCII 一律用 `TextEncoder`
+编码整个码点。转义序列本身全是 ASCII，按码点索引与按码元索引在转义处理上等价。
+
+### 回归测试（11 组）
+
+- 重命名 ×8：`oldPath` 捕获、C-quoted 新旧路径反解码、单行修改只报 1 行、
+  多段修改报两段区间、纯重命名（内容不变）报空区间而非整文件、`--staged` 下同样正确、
+  与未跟踪文件并存、变更行范围端到端进入提示词、重命名 diff 段按新路径归组；
+- 非 BMP ×2：emoji / CJK 扩展 B 往返、与 C 转义混排、八进制形态不回归、
+  无 U+FFFD；多字节与转义组合（八进制边界、`\"`、`\\`、tab）不回归；
+- 同步更新 1 组既有用例（`parseDiffOutput` 的 M/A/R/C 断言纳入 `oldPath`）。
+
+验证：两处修复各自**单独回退**后对应用例必然失败（重命名 6 组失败、
+非 BMP 1 组失败），确认测试真实钉住缺陷；修复后 50/50 通过。
+
+## 9.9 次要项清理（2026-09-30）：严格索引 / 终止原因分类 / 文档漂移
+
+上一节审查同时记录的三个次要项，本次一并处理，测试 50 → 57。
+
+### 1. 开启 `noUncheckedIndexedAccess`
+
+`tsconfig.json` 的 `noUncheckedIndexedAccess` 由 `false` 改为 `true`。开启后仅暴露
+**1 处**错误（`tokenizeArgs` 的 `input[i]`），说明源码本就按防御式风格书写，此前的
+关闭属于不必要的宽松。
+
+修复方式不是加 `!` 断言，而是改为按码点迭代（`for (const char of input)`）——
+同时消除了「按 UTF-16 码元切分」的同类隐患，与 §9.8 缺陷 2 的处理口径一致。
+
+### 2. 区分「超时」与「取消」
+
+**问题**：`describeGitFailure` 把 `code === null` 一律显示成 `"signal"`，用户无法
+分辨是自己按了取消、仓库太大超时、还是进程被杀。`graceMs: 7_000` 也容易被误读成
+deadline。
+
+**关键约束**：dsh subprocess seam **刻意不做**超时/取消分类——
+其类型注释明确写着「Deliberately carries NO timeout or cancellation classification
+（the caller reads the signal it owns to classify causes）」，`SubprocessOutcome` 只有
+`exitCode` / `signal`。所以分类责任在插件侧：必须自己持有 deadline。
+
+**修复**：
+
+- 新增 `GIT_TIMEOUT_MS = 30_000` 作为插件自持的 deadline，经
+  `AbortSignal.any([callerSignal, timeout])` 合并后交给 seam；
+- `GitResult` 扩展 `signal` / `timedOut` / `cancelled` 三个字段；
+- `describeGitFailure` 按**取消 > 超时 > 被信号杀死 > 退出码**的优先级出文案：
+  `cancelled` / `timed out after 30s` / `killed by SIGKILL` / `code 128`；
+- `graceMs` 7s → 2s，并在注释中澄清它只是「终止后收尾/排空管道」的宽限期，不是 deadline。
+
+`AbortSignal.timeout` 的计时器是 unref 的，不会拖住进程退出（实测单次调用后
+node 进程总墙钟 210ms，无 30s 滞留）。
+
+### 3. 文档漂移
+
+- MIGRATION §5 的「测试覆盖」清单严重滞后（仍写「参数解析 ×4…」约 17 项，
+  实际已 50+），改为按被测对象分组的真实计数，并注明「以 `npm test` 输出为准」；
+- §9 变更记录开头补充阅读约定：各条目的测试计数（17/17、22/22、39/39…）是
+  **当日验证快照**，不随后续用例增加回改——避免读者把历史记录误读为现状；
+- README 功能清单同步补充：重命名新旧路径成对 + `-M`、非 BMP 路径支持、
+  终止原因区分（取消 / 超时 30s / 信号 / 退出码）。
+
+### 回归测试（7 组新增）
+
+`runGit` 正常退出、非 0 退出码不误判、已取消标记 `cancelled`、未取消不误报、
+非 git 仓库文案含 `code N` 且不出现含糊 `(signal)`、被信号杀死含 `SIGKILL`、
+合并 deadline 确实传给 `subprocess.spawn`。
+
+验证：临时副本中把 `describeGitFailure` 退回旧的 `signal`/`code` 两分支后，
+「被信号杀死含信号名」用例失败（56 pass / 1 fail），确认测试钉住新分类；
+修复后 57/57 通过。`noUncheckedIndexedAccess` 的生效以一个注入的
+`xs[0].toUpperCase()` 探针验证（报 TS2532）。
 

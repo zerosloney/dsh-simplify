@@ -11,6 +11,12 @@ export interface LineRange {
 export interface ChangedFile {
   readonly path: string;
   readonly status: "modified" | "added" | "renamed" | "copied";
+  /**
+   * 重命名/复制的来源路径（`git diff --name-status` 的第二个路径）。
+   * 取变更行时必须把新旧路径同时交给 pathspec，否则 git 的 rename 检测会因为
+   * 找不到配对而把重命名降级成「新文件」，导致整个文件被误报为全文件变更。
+   */
+  readonly oldPath?: string;
   readonly changedLines?: readonly LineRange[];
 }
 

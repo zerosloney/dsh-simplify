@@ -35,12 +35,30 @@ export interface GitResult {
   readonly stderr: string;
   /** stdout 超出保留窗口被截断（头部丢失）：此时解析结果不可信。 */
   readonly lossy: boolean;
+  /** 结束该进程的信号（如 'SIGTERM'）；正常退出为 null。 */
+  readonly signal: NodeJS.Signals | null;
+  /** 本次调用是否因**自身超时**（非调用方取消）被终止。 */
+  readonly timedOut: boolean;
+  /** 本次调用是否因调用方的 AbortSignal 取消而被终止。 */
+  readonly cancelled: boolean;
 }
+
+/**
+ * 单次 git 调用的自身时限。原来的 graceMs 只是「收到终止信号后的宽限期」，
+ * 并不是 deadline；但 subprocess seam 明确不区分超时与取消（「caller owns
+ * deadlines and cause classification」），所以这里由插件自己持有 deadline，
+ * 才能在报错里区分「超时」与「用户取消」两种终止原因。
+ */
+const GIT_TIMEOUT_MS = 30_000;
 
 /**
  * 通过 dsh subprocess seam 执行一次 git 命令。
  * 收集 stdout/stderr（有界内存，保留尾部），异常或退出码非 0 时
  * 由调用方决定如何处置；spawn 级失败会抛出。
+ *
+ * 时限策略：`GIT_TIMEOUT_MS` 与调用方的 `signal` 合并后再交给 seam，两者
+ * 任一触发都会走终止升级；返回值用 `timedOut` / `cancelled` 标明真实原因，
+ * 避免把「仓库太大超时」误报成「用户取消」。
  */
 export async function runGit(
   ctx: Context,
@@ -48,6 +66,9 @@ export async function runGit(
   cwd: string,
   signal?: AbortSignal,
 ): Promise<GitResult> {
+  const timeout = AbortSignal.timeout(GIT_TIMEOUT_MS);
+  const deadline = signal ? AbortSignal.any([signal, timeout]) : timeout;
+
   const handle = ctx.subprocess.spawn({
     // core.quotepath=off：diff/ls-files 原样输出非 ASCII 路径（中文文件名等），
     // 否则默认被八进制转义，后续按该路径取行号的 diff 也匹配不上。
@@ -58,8 +79,10 @@ export async function runGit(
       stdout: { maxBytes: 8 * 1024 * 1024 },
       stderr: { maxBytes: 1024 * 1024 },
     },
-    graceMs: 7_000,
-    signal,
+    // graceMs 只是「终止后给子进程收尾/排空管道」的宽限期（不是 deadline；
+    // deadline 由上面的 GIT_TIMEOUT_MS 持有）。
+    graceMs: 2_000,
+    signal: deadline,
   });
   const outcome = await handle.done;
   const stdoutRead = handle.collected.stdout?.readFrom(0);
@@ -69,15 +92,26 @@ export async function runGit(
     stdout: stdoutRead?.text ?? "",
     stderr: stderrRead?.text ?? "",
     lossy: stdoutRead?.lossy ?? false,
+    signal: outcome.signal,
+    timedOut: timeout.aborted,
+    cancelled: signal?.aborted ?? false,
   };
 }
 
-function pushUtf8(bytes: number[], ch: string): void {
-  const code = ch.charCodeAt(0);
+const utf8Encoder = new TextEncoder();
+
+/**
+ * 追加一个**码点**的 UTF-8 字节。前提是调用方按码点迭代（`[...str]`）；
+ * 若按 UTF-16 码元迭代，BMP 外字符（emoji、CJK 扩展 B）会被拆成两个孤立代理项，
+ * 各自编码成 U+FFFD 替换字符。此处用 `codePointAt` 取完整码点判断 ASCII 快路径，
+ * 非 ASCII 一律交给 TextEncoder 编码整个码点。
+ */
+function pushUtf8Codepoint(bytes: number[], ch: string): void {
+  const code = ch.codePointAt(0)!;
   if (code < 0x80) {
     bytes.push(code);
   } else {
-    bytes.push(...Buffer.from(ch, "utf8"));
+    bytes.push(...utf8Encoder.encode(ch));
   }
 }
 
@@ -102,39 +136,57 @@ const C_ESCAPES: Record<string, number> = {
 export function unquoteGitPath(p: string): string {
   if (p.length < 2 || !p.startsWith('"') || !p.endsWith('"')) return p;
 
-  const end = p.length - 1;
+  // 按码点切分（而非 UTF-16 码元），否则 BMP 外字符会被拆成孤立代理项。
+  // 转义序列本身全是 ASCII，按码点索引与按码元索引在转义处理上等价。
+  const chars = [...p.slice(1, -1)];
+  const end = chars.length;
   const bytes: number[] = [];
-  for (let i = 1; i < end; i++) {
-    const ch = p[i]!;
+  for (let i = 0; i < end; i++) {
+    const ch = chars[i]!;
     if (ch !== "\\" || i + 1 >= end) {
-      pushUtf8(bytes, ch);
+      pushUtf8Codepoint(bytes, ch);
       continue;
     }
-    const octal = /^[0-7]{3}$/.exec(p.slice(i + 1, i + 4));
+    const octal = /^[0-7]{3}$/.exec(chars.slice(i + 1, i + 4).join(""));
     if (octal) {
       bytes.push(parseInt(octal[0], 8));
       i += 3;
       continue;
     }
-    const next = p[++i]!;
+    const next = chars[++i]!;
     const escaped = C_ESCAPES[next];
     if (escaped !== undefined) {
       bytes.push(escaped);
     } else {
-      pushUtf8(bytes, next);
+      pushUtf8Codepoint(bytes, next);
     }
   }
   return Buffer.from(bytes).toString("utf8");
 }
 
-/** 把一次 git 失败压缩成单行用户可读错误（取 stderr 首个非空行，通常是 fatal 行）。 */
+/**
+ * 把一次 git 失败压缩成单行用户可读错误（取 stderr 首个非空行，通常是 fatal 行）。
+ * 终止原因按优先级区分：调用方取消 > 插件超时 > 进程被信号杀死 > 普通非 0 退出码，
+ * 避免把「仓库太大超时」和「用户按了取消」都显示成含糊的 "signal"。
+ */
 function describeGitFailure(what: string, result: GitResult): string {
   const reason = result.stderr
     .split("\n")
     .map((line) => line.trim())
     .find(Boolean);
-  const code = result.code === null ? "signal" : `code ${result.code}`;
-  return `${what} failed (${code})${reason ? `: ${reason}` : ""}`;
+
+  let cause: string;
+  if (result.cancelled) {
+    cause = "cancelled";
+  } else if (result.timedOut) {
+    cause = `timed out after ${GIT_TIMEOUT_MS / 1000}s`;
+  } else if (result.code === null) {
+    cause = result.signal ? `killed by ${result.signal}` : "terminated by signal";
+  } else {
+    cause = `code ${result.code}`;
+  }
+
+  return `${what} failed (${cause})${reason ? `: ${reason}` : ""}`;
 }
 
 /**
@@ -213,6 +265,11 @@ export function parseChangedLinesPerFile(stdout: string): Map<string, LineRange[
   return result;
 }
 
+/** 反解码 C-quoted 路径并统一为正斜杠（Windows 反斜杠归一）。 */
+function normalizePath(rawPath: string): string {
+  return unquoteGitPath(rawPath).replace(/\\/g, "/");
+}
+
 export function parseDiffOutput(stdout: string): ChangedFile[] {
   const files: ChangedFile[] = [];
 
@@ -226,11 +283,18 @@ export function parseDiffOutput(stdout: string): ChangedFile[] {
     const status = STATUS_MAP[statusCode];
     if (!status) continue;
 
-    // Renamed (R100\told\tnew) and copied (C100\told\tnew) have two paths; use the new one.
-    const rawPath = (status === "renamed" || status === "copied") ? parts[2] : parts[1];
-    if (rawPath) {
-      files.push({ path: unquoteGitPath(rawPath).replace(/\\/g, "/"), status });
-    }
+    // Renamed (R100\told\tnew) and copied (C100\told\tnew) have two paths; use the new one,
+    // but keep the old one around: addChangedLines 需要它来维持 git 的 rename 检测配对。
+    const hasTwoPaths = status === "renamed" || status === "copied";
+    const rawPath = hasTwoPaths ? parts[2] : parts[1];
+    if (!rawPath) continue;
+
+    const oldPath = hasTwoPaths ? parts[1] : undefined;
+    files.push({
+      path: normalizePath(rawPath),
+      status,
+      ...(oldPath ? { oldPath: normalizePath(oldPath) } : {}),
+    });
   }
 
   return files;
@@ -243,6 +307,10 @@ const DIFF_CHUNK = 40;
  * 批量取变更行区间：一次 `git diff --unified=0 [--cached] <ref> -- <paths...>`
  * 携带多个路径，按 `+++` 段归组。失败或 stdout 截断（lossy）的块整体降级为
  * 「行号不可用」（提示词侧有现成的 inspect-diff 兜底文案）。
+ *
+ * 重命名/复制必须**同时**传入新旧路径：只给新路径时 git 的 rename 检测找不到配对，
+ * 会把该文件降级成「新文件」并报告整个文件为变更行，从而击穿提示词的范围锁。
+ * `-M` 显式开启重命名检测（`diff.<driver>` 等配置可能关掉默认值）。
  */
 async function addChangedLines(
   ctx: Context,
@@ -255,7 +323,7 @@ async function addChangedLines(
   const targets = files.filter((f) => f.status !== "added");
   if (targets.length === 0) return [...files];
 
-  const args = ["diff", "--unified=0", "--no-ext-diff"];
+  const args = ["diff", "--unified=0", "--no-ext-diff", "-M"];
   if (options.staged) {
     // `git diff --cached <ref>`：暂存区 vs 指定基准。默认基准省略 ref（等价
     // `--cached HEAD`，且在无首提交的仓库里裸 --cached 依然可用）。
@@ -268,12 +336,16 @@ async function addChangedLines(
   const changed = new Map<string, readonly LineRange[]>();
   for (let i = 0; i < targets.length; i += DIFF_CHUNK) {
     const chunk = targets.slice(i, i + DIFF_CHUNK);
-    const result = await runGit(ctx, [...args, "--", ...chunk.map((f) => f.path)], cwd, signal);
+    // 新旧路径都进 pathspec（去重：普通文件只有 path，重命名/复制额外带 oldPath）。
+    const paths = [...new Set(chunk.flatMap((f) => (f.oldPath ? [f.oldPath, f.path] : [f.path])))];
+    const result = await runGit(ctx, [...args, "--", ...paths], cwd, signal);
     if (result.code !== 0 || result.lossy) continue;
     const perFile = parseChangedLinesPerFile(result.stdout);
     for (const file of chunk) {
-      // 无输出段（无改动）与纯删除文件一致：空区间
-      changed.set(file.path, perFile.get(file.path) ?? []);
+      // 重命名段在 `+++` 行上以新路径出现；退化段（未识别为 rename 时）可能只有旧路径。
+      // 无输出段（无改动）与纯删除文件一致：空区间。
+      const lines = perFile.get(file.path) ?? (file.oldPath ? perFile.get(file.oldPath) : undefined);
+      changed.set(file.path, lines ?? []);
     }
   }
 
@@ -301,12 +373,15 @@ export async function getChangedFiles(
       return { files: [], error: describeGitFailure("git ls-files", untracked) };
     }
     const untrackedPaths = new Set(
-      untracked.stdout.split("\n").map((line) => unquoteGitPath(line.trim())).filter(Boolean),
+      untracked.stdout.split("\n").map((line) => normalizePath(line.trim())).filter(Boolean),
     );
-    const files = options.files.map((p) => ({
-      path: p.replace(/\\/g, "/"),
-      status: untrackedPaths.has(p.replace(/\\/g, "/")) ? ("added" as const) : ("modified" as const),
-    }));
+    const files = options.files.map((p) => {
+      const normalized = p.replace(/\\/g, "/");
+      return {
+        path: normalized,
+        status: untrackedPaths.has(normalized) ? ("added" as const) : ("modified" as const),
+      };
+    });
     const withLines = await addChangedLines(ctx, cwd, options, files, options.ref, signal);
     return { files: withLines };
   }
