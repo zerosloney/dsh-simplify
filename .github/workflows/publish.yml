@@ -9,7 +9,8 @@ on:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # 钉死镜像版本（ubuntu-latest 现为 24.04），避免发布环境随 GitHub 迁移而变。
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:

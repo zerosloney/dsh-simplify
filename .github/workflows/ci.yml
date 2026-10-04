@@ -10,7 +10,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # 钉死镜像版本以求可复现构建：`-latest` 会在 GitHub 侧静默迁移 OS
+        # （ubuntu-latest 现为 24.04，windows-latest 现为 Server 2025）。
+        # 这两个标签即当前 latest 的实际指向，升级需显式改这里。
+        os: [ubuntu-24.04, windows-2025]
         node: [22]
     runs-on: ${{ matrix.os }}
     steps:
